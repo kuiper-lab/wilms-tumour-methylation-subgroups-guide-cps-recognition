@@ -1,0 +1,784 @@
+---
+title: "Wilms Tumour Methylation Preprocessing"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_smooth: true
+    toc_depth: 2
+    number_sections: true
+    number-depth: 2
+    css: "/hpc/pmc_kuiper/Wilms/METHYLATION/doc.css"
+date: "`r Sys.Date()`"
+author: "Franziska Oberhammer"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Environment Setup and Library Loading
+We load the required packages for DNA methylation analysis, quality control (sesame), batch effect evaluation, visualization, and general data manipulation.
+
+```{r load_packages, warning=FALSE, message=FALSE}
+library(circlize)
+library(cowplot)
+library(details)
+library(eulerr)
+library(ggplot2)
+library(ggpubr)
+library(ggthemes)
+library(grid)
+library(gridExtra)
+library(patchwork)
+library(plotly)
+library(purrr)
+library(reactable)
+library(readxl)
+library(RColorBrewer)
+library(sesame)
+library(summarytools)
+library(sva)
+library(tidyverse)
+library(qs)
+```
+
+Important Prerequisites & Technical Notes:
+
+- R Version: EPICv2 preprocessing requires R version 4.4.x or higher.
+- QC Note: Quality control filtering relies on standard deviation thresholds computed from the sample population. Because samples failing QC are excluded prior to public upload, recalculating metrics on a subsetted dataset will result in different standard deviations and potentially different filtering results.
+
+# Global Parameters and Settings
+We establish directory paths and execution flags to govern script behaviour (re-running computationally expensive steps vs. loading pre-cached data).
+
+```{r configuration, results='hide', cache=FALSE}
+parameters <- list()
+
+# Project Directory Paths ------------------------------------------------------
+parameters$PROJECT_FOLDER          <- "/hpc/pmc_kuiper/Wilms/METHYLATION"
+parameters$CODE_FOLDER             <- file.path(parameters$PROJECT_FOLDER, "CODE") 
+parameters$DATA_FOLDER             <- file.path(parameters$PROJECT_FOLDER, "DATA") 
+parameters$ANALYSIS_FOLDER         <- file.path(parameters$PROJECT_FOLDER, "ANALYSIS") 
+parameters$PROCESSED_DATA_FOLDER   <- file.path(parameters$ANALYSIS_FOLDER, "PROCESSED_DATA") 
+  
+parameters$CURRENT_SAMPLESHEET     <- file.path(parameters$PROCESSED_DATA_FOLDER, "sample_sheet_updated_20260601.rds")
+parameters$CURRENT_SAMPLEID_SHEET  <- file.path(parameters$DATA_FOLDER, "SAMPLE_SHEETS", "20240322_Samples_SentrixID_all.xlsx")
+
+
+# Computational Workflow Flags -------------------------------------------------
+# Processing raw IDATs (~160 samples) takes approximately 8 hours.
+# Set these switches to TRUE only when recalculation or re-saving is needed.
+CHANGE_SAMPLESHEET  <- FALSE
+RERUN_PROCESSING    <- FALSE
+SAVE_PLOTS          <- FALSE
+JUST_LOAD_BETAS     <- TRUE
+REGENERATE_SNP_VCFs <- FALSE
+
+# External Scripts and Palettes ------------------------------------------------
+source(file.path(parameters$CODE_FOLDER, "00_theme_Publication.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_colour_palettes.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_helper_functions.R"))
+```
+
+# Overview of available samples
+We read the primary metadata sheets and link physical chip identifiers (Sentrix ID and Position) with sample names, subsetting to the training cohort.
+
+```{r read_samplesheets, message=FALSE}
+
+sample_sheets <- list()
+
+# 1. Load Primary Metadata and Annotate Missing Identifiers ---------------------
+sample_sheets$sample_sheet_original <- readRDS(parameters$CURRENT_SAMPLESHEET)$SAMPLESHEET %>% as.data.frame() %>% 
+    mutate(M_Label = case_when( # M labels still missing for these samples, so we add them
+    Internal_Patient_ID == "DQ" ~ "M002AAH",
+    Internal_Patient_ID == "EO" ~ "M020AAH",
+    Internal_Patient_ID == "FA" ~ "M367AAG",
+    TRUE ~ M_Label)
+  )
+
+# 2. Load and Format IDAT Mapping Metadata -------------------------------------
+sample_sheets$sample_sheet_idats <- readxl::read_xlsx(parameters$CURRENT_SAMPLEID_SHEET) %>% 
+  filter(!is.na(barcode)) %>% 
+  separate(barcode, c("Sentrix_ID", "Sentrix_Position"), remove = FALSE) %>% 
+  mutate(Sample_ID = EPIC_Nummer,
+         EPIC_Nummer = NULL)
+
+# 3. Merge Metadata and Restrict to Training Cohort ----------------------------
+sample_sheets$sample_sheet <- left_join(sample_sheets$sample_sheet_original, sample_sheets$sample_sheet_idats) %>% 
+  filter(Cohort == "Train")
+
+```
+
+```{r tidy_samplesheet}
+
+# 4. Resolve Array Version Mappings for Paired Samples -------------------------
+# Two patients have DNAm profiles across both EPIC v1 and EPIC v2 arrays.
+# We create a composite ID to correctly assign platform-specific QC parameters
+# and maintain these pairs for cross-platform validation.
+
+sample_sheets$sample_sheet <- sample_sheets$sample_sheet %>% mutate(Internal_Patient_ID_with_version = paste0(Internal_Patient_ID, 
+                                                                       if_else(is.na(str_sub(Sample_ID, start = 12)), 
+                                                                               "", 
+                                                                               str_sub(Sample_ID, start = 12))))
+
+# Update array platform annotations
+sample_sheets$sample_sheet <- sample_sheets$sample_sheet %>% 
+  mutate(DNA_Meth_by = ifelse(is.na(Internal_Patient_ID_with_version), NA, ifelse(Internal_Patient_ID_with_version =="FY_V1", "Diagnostics", as.character(DNA_Meth_by))),
+         DNA_Meth_by = ifelse(is.na(Internal_Patient_ID_with_version), NA, ifelse(Internal_Patient_ID_with_version =="FY_V2", "Diagnostics_EPIC_V2", as.character(DNA_Meth_by))),
+         DNA_Meth_by = ifelse(is.na(Internal_Patient_ID_with_version), NA, ifelse(Internal_Patient_ID_with_version =="CI_V1", "Diagnostics", as.character(DNA_Meth_by))),
+         DNA_Meth_by = ifelse(is.na(Internal_Patient_ID_with_version), NA, ifelse(Internal_Patient_ID_with_version =="CI_V2", "Diagnostics_EPIC_V2", as.character(DNA_Meth_by)))) %>% 
+  mutate(DNA_Meth_by = factor(DNA_Meth_by)) %>% 
+  mutate(Sample_ID = case_when(is.na(Sample_ID)~ Methylation_ID, 
+                               TRUE ~ Sample_ID))
+
+
+
+# Interactive Inspection Table -------------------------------------------------
+DT::datatable(sample_sheets$sample_sheet,
+              filter = "top", class = 'cell-border stripe', extensions = 'Buttons',
+              options = list(dom = 'Bfrtip',
+                             buttons = c('copy', 'csv', 'excel'),
+                             scrollX = T))
+
+```
+
+# Quality Control (SeSAMe)
+We import raw IDAT intensity files into SeSAMe SigSet objects (sdfs).
+
+```{r SeSAMe load}
+# Load or import raw IDAT files into SeSAMe objects
+if(CHANGE_SAMPLESHEET==TRUE){
+  sdfs = lapply(searchIDATprefixes(parameters$DATA_FOLDER), readIDATpair)
+  qsave(file = file.path(parameters$PROCESSED_DATA_FOLDER, "sesame_raw.qs"), x = sdfs)
+} else {
+  sdfs <- qread(file.path(parameters$PROCESSED_DATA_FOLDER, "sesame_raw.qs"))
+}
+
+# Map array barcodes to unique Sample IDs
+names(sdfs) <- sample_sheets$sample_sheet_idats$Sample_ID[match(names(sdfs),  sample_sheets$sample_sheet_idats$barcode)]
+sample_names_sdfs <- names(sdfs)
+```
+
+## SeSAMe Quality Metrics Computation
+We compute key array quality parameters including probe count statistics, signal detection rates, intensity distributions, channel switching, and dye bias.
+We plot them for each EPIC array version individually.
+
+
+```{r QC_calculation}
+# 1. Compute Individual Metric Sets --------------------------------------------
+
+# Probe counts
+if(CHANGE_SAMPLESHEET==TRUE){
+  qcs_numProbes = openSesame(sdfs, prep="", func=sesameQC_calcStats, funs="numProbes")
+  qsave(qcs_numProbes, file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_numProbes.qs"))
+} else {
+  qcs_numProbes <- qread(file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_numProbes.qs"))
+}
+qcs_numProbes_all <-do.call(rbind, lapply(qcs_numProbes, as.data.frame))
+
+# Signal detection p-values
+if(CHANGE_SAMPLESHEET==TRUE){
+  qcs_detection = openSesame(sdfs, prep="", func=sesameQC_calcStats, funs="detection")
+  qsave(qcs_detection, file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_detection.qs"))
+} else {
+  qcs_detection <- qread(file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_detection.qs"))
+}
+qcs_detection_all <-do.call(rbind, lapply(qcs_detection, as.data.frame))
+
+# Signal intensities
+if(CHANGE_SAMPLESHEET==TRUE){
+  qcs_intensity = openSesame(sdfs, prep="", func=sesameQC_calcStats, funs="intensity")
+  qsave(qcs_intensity, file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_intensity.qs"))
+} else {
+  qcs_intensity <- qread(file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_intensity.qs"))
+}
+qcs_intensity_all <-do.call(rbind, lapply(qcs_intensity, as.data.frame))
+
+# Channel switching metrics
+if(CHANGE_SAMPLESHEET==TRUE){
+  qcs_channel = openSesame(sdfs, prep="", func=sesameQC_calcStats, funs="channel")
+  qsave(qcs_channel, file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_channel.qs"))
+} else {
+  qcs_channel <- qread(file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_channel.qs"))
+}
+qcs_channel_all <-do.call(rbind, lapply(qcs_channel, as.data.frame))
+
+# Dye bias metrics
+if(CHANGE_SAMPLESHEET==TRUE){
+  qcs_dyeBias = openSesame(sdfs, prep="", func=sesameQC_calcStats, funs="dyeBias")
+  qsave(qcs_dyeBias, file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_dyeBias.qs"))
+} else {
+  qcs_dyeBias <- qread(file.path(parameters$ANALYSIS_FOLDER, "QC", "qcs_dyeBias.qs"))
+}
+qcs_dyeBias_all <- do.call(rbind, lapply(qcs_dyeBias, as.data.frame))
+
+
+# 2. Merge QC Metrics with Sample Metadata --------------------------------------
+stopifnot(rownames(qcs_dyeBias_all) == rownames(qcs_channel_all))
+stopifnot(rownames(qcs_numProbes_all) == rownames(qcs_intensity_all)) 
+stopifnot(rownames(qcs_channel_all) == rownames(qcs_intensity_all) )
+stopifnot(rownames(qcs_detection_all) == rownames(qcs_intensity_all) )
+
+qcs_all <- cbind(qcs_dyeBias_all,
+                 qcs_channel_all, 
+                 qcs_numProbes_all, 
+                 qcs_intensity_all, 
+                 qcs_detection_all)
+
+
+qcs_all_with_samplesheet <- left_join(sample_sheets$sample_sheet %>% select(Internal_Patient_ID, Age_diagnosis, Methylation_ID, Sample_Group, Sample_ID, DNA_Meth_by, EPIC_Version),  by = "Sample_ID", qcs_all %>% rownames_to_column(var = "Sample_ID"))
+```
+
+```{r QC_plots}
+# Format QC metrics into long structure for interactive plotting
+qcs_all_with_samplesheet_long <- qcs_all_with_samplesheet %>% 
+  dplyr::select(-c("na_intensity_ig", "na_intensity_ir", "num_probes", "num_probes_II", "num_probes_IR", "num_probes_IG", "num_probes_cg", "num_probes_ch", "num_probes_rs", "na_intensity_M", "na_intensity_U", "na_intensity_ii", "num_dtna", "frac_dtna", "Methylation_ID")) %>% 
+  reshape2::melt( id.vars = c("Sample_ID", "Internal_Patient_ID", "Sample_Group",  "Age_diagnosis",  "DNA_Meth_by", "EPIC_Version")
+)
+
+```
+
+
+### Reference: Evaluated QC Metrics Overview
+
+Dye Bias
+| QC | Metric | Description |
+| ---| --- | --- |
+| Dye Bias | `medR` | Median Inf.I Intens. Red |
+| Dye Bias | `medG` | Median Inf.I Intens. Grn |
+| Dye Bias | `topR` | Median of Top 20 Inf.I Intens. Red |
+| Dye Bias | `topG` | Median of Top 20 Inf.I Intens. Grn |
+| Dye Bias | `RGratio` | Ratio of Red-to-Grn median Intens. |
+| Dye Bias | `RGdistort` | Ratio of Top vs. Global R/G Ratios |
+
+
+Colour Channel
+| QC | Metric | Description |
+| ---| --- | --- |
+| Colour Channel | `InfI_switch_R2R` | N. Inf.I Probes Red -> Red | 
+| Colour Channel | `InfI_switch_G2G` | N. Inf.I Probes Grn -> Grn | 
+| Colour Channel | `InfI_switch_R2G` | N. Inf.I Probes Red -> Grn | 
+| Colour Channel | `InfI_switch_G2R` | N. Inf.I Probes Grn -> Red | 
+
+
+Signal Intensity
+| QC | Metric | Description |
+| ---| --- | --- |
+| Signal Intensity | `mean_intensity` |  Mean sig. intensity | 
+| Signal Intensity | `mean_intensity_MU` |  Mean sig. intensity (M+U) |
+| Signal Intensity | `mean_ii` |  Mean sig. intensity (Inf.II) |
+| Signal Intensity | `mean_inb_grn` |  Mean sig. intens.(I.Grn IB) |
+| Signal Intensity | `mean_inb_red` |  Mean sig. intens.(I.Red IB) |
+| Signal Intensity | `mean_oob_grn` |  Mean sig. intens.(I.Grn OOB) |
+| Signal Intensity | `mean_oob_red` |  Mean sig. intens.(I.Red OOB) |
+| Signal Intensity | `na_intensity_M` |  N. NA in M (all probes) |
+| Signal Intensity | `na_intensity_U` |  N. NA in U (all probes) |
+| Signal Intensity | `na_intensity_ig` |  N. NA in raw intensity (IG) |
+| Signal Intensity | `na_intensity_ir` |  N. NA in raw intensity (IR) |
+| Signal Intensity | `na_intensity_ii` |  N. NA in raw intensity (II) |
+
+Detection
+| QC | Metric | Description |
+| ---| --- | --- |
+| Detection | `num_dtna` | N. Probes w/ Missing Raw Intensity |
+| Detection | `frac_dtna` | % Probes w/ Missing Raw Intensity |
+| Detection | `num_dt` | N. Probes w/ Detection Success |
+| Detection | `frac_dt` | % Detection Success |
+| Detection | `num_dt_mk` | N. Detection Succ. (after masking) |
+| Detection | `frac_dt_mk` | % Detection Succ. (after masking) |
+| Detection | `num_dt_cg` | N. Probes w/ Detection Success (cg) |
+| Detection | `frac_dt_cg` | % Detection Success (cg) |
+| Detection | `num_dt_ch` | N. Probes w/ Detection Success (ch) |
+| Detection | `frac_dt_ch` | % Detection Success (ch) |
+| Detection | `num_dt_rs` | N. Probes w/ Detection Success (rs) |
+| Detection | `frac_dt_rs` | % Detection Success (rs) |
+
+
+### QC Plots: EPIC v1 Arrays
+
+```{r QC_plots_EPICV1, warning=FALSE}
+ggplotly(
+  ggplot(
+    qcs_all_with_samplesheet_long %>% filter(EPIC_Version == "EPIC_V1"),
+    aes(x = variable, y = value, fill = variable))+
+    geom_violin()+
+    geom_jitter(aes(text = paste("Intenral Patient ID:", Internal_Patient_ID)), height = 0)+
+    facet_wrap(~variable, scales = "free")+
+    xlab("")+
+    ggtitle("EPIC v1")
+, tooltip=c("text", "x", "y")) %>% 
+  style(showlegend = FALSE)
+```
+
+### QC Plots: EPIC v2 Arrays
+
+```{r QC_plots_EPICV2, warning=FALSE}
+ggplotly(
+  ggplot(
+    qcs_all_with_samplesheet_long %>% filter(EPIC_Version == "EPIC_V2"),
+    aes(x = variable, y = value, fill = variable))+
+    geom_violin()+
+    geom_jitter(aes(text = paste("Intenral Patient ID:", Internal_Patient_ID)), height = 0)+
+    facet_wrap(~variable, scales = "free")+
+    xlab("")+
+    ggtitle("EPIC v2")
+, tooltip=c("text", "x", "y")) %>% 
+  style(showlegend = FALSE)
+```
+
+
+## Outlier Calculation and Sample Filtering
+We evaluate samples against a 3 Standard Deviation threshold across all computed metrics. Samples failing >10% of total QC metrics are flagged for exclusion.
+Because the 3–standard deviation threshold is calculated across all computed metrics, re-running QC on only the remaining samples would recalculate the baseline and inappropriately flag previously approved samples. Since all uploaded samples have already passed initial QC (failing <10% of metrics), this step should be skipped to preserve the dataset.
+
+
+```{r QC_final_calculations}
+# Calculate platform-specific metric means and standard deviations
+qc_summary_df <- qcs_all_with_samplesheet_long %>%
+  group_by(EPIC_Version, variable) %>%
+  summarise(mean=mean(value), sd=sd(value))
+
+# Standard Deviation boundary helper
+is_within_3sd <- function(value, mean, sd) {
+  abs(value - mean) <= 3 * sd
+}
+
+# Flag metric passes/failures per sample
+qcs_all_with_samplesheet_long$QC_PASS_variable <- NA
+
+for (i in 1: dim(qcs_all_with_samplesheet_long)[1]){
+  EPIC_V_temp <- qcs_all_with_samplesheet_long[i, "EPIC_Version"]
+  var_temp <-  qcs_all_with_samplesheet_long[i, "variable"] %>% as.character()
+  value_temp <- qcs_all_with_samplesheet_long[i, "value"]
+  qc_temp <- qc_summary_df %>% filter(EPIC_Version==EPIC_V_temp, variable == var_temp)
+  qc_pass <- is_within_3sd(value = value_temp,
+                           mean = qc_temp$mean,
+                           sd = qc_temp$sd)
+
+  qcs_all_with_samplesheet_long[i,"QC_PASS_variable"] <- qc_pass
+}
+
+# Pivot back to wide format and quantify total failures
+QCtests <- reshape2::dcast(qcs_all_with_samplesheet_long, formula = Sample_ID ~ variable, value.var = "QC_PASS_variable")
+colnames(QCtests) <- paste0(colnames(QCtests), "_QC")
+QCtests <- QCtests %>%
+  column_to_rownames("Sample_ID_QC") %>%
+  mutate(QC_metrixs_failed = rowSums(!.)) %>%  #get number of qc fails per sample
+  rownames_to_column("Sample_ID")
+
+# Merge QC metrics back into metadata
+qcs_all_with_samplesheet <- left_join(qcs_all_with_samplesheet, QCtests)
+
+# Mark overall failure if more than 10% of individual tests fail
+number_of_QC_columns <- length(colnames(qcs_all_with_samplesheet)[grepl(colnames(qcs_all_with_samplesheet), pattern  = "_QC")])
+
+qcs_all_with_samplesheet$QC_FAIL <- NA
+
+qcs_all_with_samplesheet <- qcs_all_with_samplesheet %>%
+  mutate(QC_FAIL = ifelse(QC_metrixs_failed > number_of_QC_columns/10, "FAIL", QC_FAIL))
+
+sample_sheets$sample_sheet_QC <- left_join(sample_sheets$sample_sheet, qcs_all_with_samplesheet %>%
+            dplyr::select(Sample_ID, QC_FAIL))
+```
+
+
+```{r cleanGlobalEnvironment3}
+# Clean temporary QC calculation objects
+rm(qcs_numProbes, qcs_detection, qcs_intensity, qcs_channel, qcs_dyeBias, 
+   qcs_dyeBias_all, qcs_channel_all, qcs_numProbes_all, qcs_intensity_all, 
+   qcs_detection_all, qcs_all, qcs_all_with_samplesheet, qcs_all_with_samplesheet_long, 
+   QCtests, qc_temp, qc_summary_df, i, EPIC_V_temp, number_of_QC_columns, value_temp, var_temp, qc_pass)
+```
+
+## Bisulfite Conversion Quality Control
+
+We quantify residual incomplete bisulfite conversion using GCT scores calculated from C/T-extension probes (Zhou et al. 2017). Values close to 1.0 indicate optimal conversion.
+
+```{r}
+# Set local cache directory for ExperimentHub dependencies
+Sys.setenv(EXPERIMENT_HUB_CACHE="/hpc/pmc_kuiper/foberhammer/Rstudio_Server_Libs/ExperimentHub_cache_forRVersion4.4.2/")
+
+# Subset raw objects to valid target samples
+sdfs_manuscript <- sdfs[names(sdfs) %in%  sample_sheets$sample_sheet_QC$Sample_ID] 
+
+# Split up in EPICv1 and EPICv2
+sdfs_V1 <- sdfs_manuscript[sample_sheets$sample_sheet_QC %>% filter(!is.na(EPIC_Version)) %>%  filter(EPIC_Version == "EPIC_V1") %>% pull(Sample_ID)]
+sdfs_V2 <- sdfs_manuscript[sample_sheets$sample_sheet_QC %>% filter(!is.na(EPIC_Version)) %>% filter(EPIC_Version == "EPIC_V2") %>% pull(Sample_ID)]
+
+# 1. Compute Bisulfite Conversion for EPIC v1 ----------------------------------
+bisConversionControl_result_V1 <- lapply(setNames(names(sdfs_V1), names(sdfs_V1)), function(i) {
+  return(bisConversionControl(sdfs_V1[[i]]))
+})
+
+# 2. Compute Bisulfite Conversion for EPIC v2 ----------------------------------
+EPICv2_manifest <- read.csv(file.path(parameters$DATA_FOLDER, "BIN", "EPICv2.hg38.manifest.tsv"), sep = "\t")
+
+extR = EPICv2_manifest[!is.na(EPICv2_manifest$nextBase) & EPICv2_manifest$nextBase=="R", "Probe_ID"]
+extA = EPICv2_manifest[!is.na(EPICv2_manifest$nextBase) & EPICv2_manifest$nextBase=="A", "Probe_ID"]
+
+bisConversionControl_result_V2 <- lapply(setNames(names(sdfs_V2), names(sdfs_V2)), function(i) {
+  return(bisConversionControl(sdfs_V2[[i]], extR = extR, extA = extA))
+})
+
+# 3. Combine and Evaluate Outliers ---------------------------------------------
+bisConversionControl_result_both <- c(bisConversionControl_result_V1, bisConversionControl_result_V2)
+
+bisConversionControl_result_both_df <- do.call(rbind, bisConversionControl_result_both) %>% as.data.frame() %>% rownames_to_column()
+colnames(bisConversionControl_result_both_df) <- c("Sample_ID", "bisConversionControl")
+
+bisConversionControl_result_both_df <- left_join(bisConversionControl_result_both_df, sample_sheets$sample_sheet_QC %>% select(Sample_ID, Internal_Patient_ID_with_version))
+
+# Statistical summary
+bisConversionControl_result_both_df_summary <- bisConversionControl_result_both_df %>% 
+  summarise(mean=mean(bisConversionControl), sd=sd(bisConversionControl))
+
+bisConversionControl_result_both_df <- bisConversionControl_result_both_df %>% 
+  mutate(mean = bisConversionControl_result_both_df_summary$mean,
+         sd = bisConversionControl_result_both_df_summary$sd)
+
+# Interactive conversion score visualization
+ggply <- ggplotly(ggplot(bisConversionControl_result_both_df, aes(x = Internal_Patient_ID_with_version, y = bisConversionControl))+
+  geom_line(aes(x = Internal_Patient_ID_with_version, y = mean, group = 1, colour = "mean"))+
+  geom_line(aes(x = Internal_Patient_ID_with_version, y = mean + 3*sd, group = 1, colour = "mean + 3sd"), linetype = "dashed")+
+  geom_bar(position = "dodge", stat = "identity")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), legend.title = element_blank())+
+  labs(colour = ""))%>%
+  style(textposition = "none")
+
+ggply
+
+
+# 4. Outlier Flagging and Metadata Updating ------------------------------------
+bisConversionControl_result_both_df$bisConversionControl_testResult <- NA
+
+for (r in 1:dim(bisConversionControl_result_both_df)[1]){
+  Sample_ID_temp <- bisConversionControl_result_both_df[r,"Sample_ID"]
+  bisConversionControl_temp <- bisConversionControl_result_both_df[r,"bisConversionControl"]
+  bisConversionControl_mean <- bisConversionControl_result_both_df_summary$mean
+  bisConversionControl_sd <- bisConversionControl_result_both_df_summary$sd
+
+  is_within_3sd_temp <- is_within_3sd(bisConversionControl_temp, mean = bisConversionControl_mean, sd = bisConversionControl_sd)
+  
+  bisConversionControl_result_both_df[r,"bisConversionControl_testResult"] <- is_within_3sd_temp
+}
+
+sample_sheets$sample_sheet_QC_bisulfite <- left_join(
+  sample_sheets$sample_sheet_QC, 
+  bisConversionControl_result_both_df %>% dplyr::select(Sample_ID, bisConversionControl_testResult),
+  by = "Sample_ID") %>% 
+  mutate(QC_FAIL = ifelse(bisConversionControl_testResult == FALSE, "FAIL", QC_FAIL))
+
+# Clean temporary bisulfite workflow objects
+rm(bisConversionControl_result_both_df, ggply, bisConversionControl_result_both_df_summary,bisConversionControl_result_both,
+   bisConversionControl_result_V1, bisConversionControl_result_V2, EPICv2_manifest, sdfs_V1, sdfs_V2, bisConversionControl_mean, 
+   bisConversionControl_sd, bisConversionControl_temp, extA, extR, r, Sample_ID_temp)
+```
+
+# Preprocessing Pipeline Executions
+
+We execute the target SeSAMe pre-processing string (QCDPB):
+
+| One letter code| Function | Description | 
+| --- | --- | --- |
+| `Q` | `qualityMask` | Mask probes of poor design |
+| `C` | `inferInfiniumIChannel` | Infer channel for Infinium-I probes |
+| `D` | `dyeBiasNL` | Dye bias correction (non-linear) |
+| `P` | `pOOBAH` | Detection p-value masking using oob |
+| `B` | `noob` | Background subtraction using oob |
+
+
+*oob = out of band*
+
+
+```{r runPreprocess}
+# Note: If preprocessCore fails during multithreading, reinstall via:
+# BiocManager::install("preprocessCore", configure.args="--disable-threading")
+
+if(RERUN_PROCESSING == TRUE){
+  # this has to be done with R 4.3.1. With the newer version it did not work
+  sdfs_preped <- lapply(sdfs, function(s) (openSesame(s, prep="QCDPB", func=NULL)))
+  qsave(sdfs_preped, file.path(parameters$PROCESSED_DATA_FOLDER, "sesame_sdfs_preped.qs"))
+} else {
+  sdfs_preped <- qread(file.path(parameters$PROCESSED_DATA_FOLDER, "sesame_sdfs_preped.qs"))
+}
+
+```
+
+
+## Preprocessing QC Evaluation
+
+### Quality Check: Background Subtraction
+
+We verify background subtraction by comparing pre- and post-processing Beta-value distributions across probe design types. Results are exported directly to PDF.
+
+```{r QC_backgroundsubtraction}
+
+if (CHANGE_SAMPLESHEET == TRUE){
+  pdf(file = file.path(parameters$ANALYSIS_FOLDER, "QC", "QC_plotBetaByDesign.pdf"), width = 10, height = 4)
+  
+  for (i in names(sdfs)){
+    
+    sdf_raw <- sdfs[[i]]
+    sdf_processed <- sdfs_preped[[i]]
+    
+# Calculate uniform density upper limits for plot alignment
+    ylimit_p <- max(c(density(na.omit(sesame:::getBetas(sdf_raw)))$y,
+                      density(na.omit(sesame:::getBetas(sdf_processed)))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfIR(sdf_raw))))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfIR(sdf_processed))))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfIG(sdf_raw))))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfIG(sdf_processed))))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfII(sdf_raw))))$y,
+                      density(na.omit(sesame:::getBetas(sesame:::InfII(sdf_processed))))$y
+    ))
+    ylimit_plot <- ylimit_p+ylimit_p*0.1
+    
+    # Generate side-by-side comparative density plots # function is adapted from sesame. can be found in helper functions
+    raw_plot <- QC_plotBetaByDesign(sdf = sdf_raw, ggtitle("raw"))+
+      theme(legend.position="none") +
+      ylim(0, ylimit_plot)
+    
+    processed_plot <- QC_plotBetaByDesign(sdf = sdf_processed, ggtitle("processed"))+
+      ylim(0, ylimit_plot)
+    
+    final_plot <- raw_plot + processed_plot + plot_annotation(i)
+    
+    print(final_plot)
+    dev.off()
+  }
+  # clean global environment
+  rm(i, ylimit_p, ylimit_plot, final_plot, processed_plot, sdf_processed, sdf_raw, raw_plot, QC_plotBetaByDesign)
+}
+```
+
+
+### Quality Check: Dye Bias Correction
+
+We verify linear channel equalization by inspecting Red-Green QQ plots before and after correction.
+We use linear scaling:
+"Dye bias refers to the difference in signal intensity between the two color channel. SeSAMe offers two flavors of dye bias correction: linear scaling (dyeBiasCorr) and nonlinear scaling (dyeBiasCorrTypeINorm). Linear scaling equalize the mean of all probes from the two color channel." -sesame
+
+```{r QC_qqplot}
+
+# Generate QQ plots comparing channel distributions pre- and post-correction
+QQ_plots <- lapply(setNames(names(sdfs), names(sdfs)), function(i) {
+  raw_plot <- QC_plotRedGrnQQ(sdfs[[i]], main = "raw")
+  processed_plot <- QC_plotRedGrnQQ(sdfs_preped[[i]], main = "processed")
+
+  final_plot <- raw_plot + processed_plot + plot_annotation(paste("R-G QQ Plot:", i))
+  return(final_plot)
+})
+
+# Save output plots to disk
+if(SAVE_PLOTS){
+  pdf(file = file.path(parameters$ANALYSIS_FOLDER, "QC", "QC_plotRedGrnQQ.pdf"), width = 10, height = 6)
+  for (i in names(QQ_plots)){
+    print(QQ_plots[[i]])
+  }
+  dev.off()
+}
+
+# clean global environment
+rm(QQ_plots)
+
+```
+
+```{r cleanGlobalEnvironment4}
+# clean raw SigSet object
+rm(sdfs)
+```
+
+# Beta Value Extraction and Cross-Platform Merging
+We extract methylation Beta values, collapsing multi-probe CPI suffixes on EPIC v2 to prefix-level target CpG identifiers, and harmonise shared CpG content between EPIC v1 and v2 platforms.
+
+```{r betas}
+
+if (JUST_LOAD_BETAS == FALSE){
+  if(RECALCULATE_BETAS){
+    # Extract Beta values collapsing suffixes to cpg prefixes using minimum p-value selection
+    betas_dfs <- lapply(setNames(names(sdfs_preped), names(sdfs_preped)), function(i) {
+      print(i)
+      tmp_obj <- sdfs_preped[[i]]
+      res <- getBetas(tmp_obj, collapseToPfx = TRUE, collapseMethod = "minPval")
+      return(res)
+    })
+    qsave(betas_dfs, file.path(parameters$PROCESSED_DATA_FOLDER, "betas_dfs.qs"))
+  } else{
+    betas_dfs <- qread(file.path(parameters$PROCESSED_DATA_FOLDER, "betas_dfs.qs"))
+  }
+  
+  # Split datasets by platform version
+  betas_dfs_V1 <- betas_dfs[sample_sheets$sample_sheet_QC_bisulfite %>%
+                              filter(EPIC_Version == "EPIC_V1") %>%
+                              pull(Sample_ID)]
+  
+  betas_dfs_V2 <- betas_dfs[sample_sheets$sample_sheet_QC_bisulfite %>%
+                              filter(EPIC_Version == "EPIC_V2") %>%
+                              pull(Sample_ID)]
+  
+  betas_V1 <- data.frame(betas_dfs_V1)
+  betas_V2 <- data.frame(betas_dfs_V2)
+  
+  # Intersect probe sets common to both platforms
+  CpGs_in_both <- intersect(rownames(betas_V1), rownames(betas_V2))
+  
+  # Merge matrix and align column order with primary sample sheet
+  betas_combined <- cbind(betas_V1[CpGs_in_both,], betas_V2[CpGs_in_both,])
+  
+  betas_combined <- betas_combined[,match(sample_sheets$sample_sheet_QC_bisulfite %>%
+                                            pull(Sample_ID), colnames(betas_combined)
+  )]
+  
+  qsave(betas_combined, file = file.path(parameters$PROCESSED_DATA_FOLDER, "betas_combined.qs"))
+  
+  # clean environment
+  rm(betas_V1, betas_V2, betas_dfs_V1, betas_dfs_V2, betas_all, sdfs, betas_dfs)
+  
+} else {
+  betas_combined <- qread(file = file.path(parameters$PROCESSED_DATA_FOLDER, "betas_combined.qs"))
+}
+```
+
+# Probe masking
+
+EPIC v1 probes were masked during SeSAMe preprocessing. 
+At the time of this analysis, the automated probe masking function was only implemented for the Illumina HumanMethylationEPIC v1 array. Consequently, EPIC v2 probe masking was performed manually by retrieving the SeSAMe-recommended masking manifests and removing these CpG probes from the combined beta-value matrix.
+
+
+```{r EPIC_V2_recomendedMask}
+# Retrieve recommended exclusion probe list for EPIC v2
+CpGs_to_mask_EPIC_V2 <- getMask(platform = "EPICv2", mask_names = "recommended")
+names(CpGs_to_mask_EPIC_V2) <- CpGs_to_mask_EPIC_V2
+
+# Lift over EPIC v2 probe IDs to target EPIC v1 probe standard
+CpGs_to_mask_EPIC_V2_liftover <- mLiftOver(CpGs_to_mask_EPIC_V2, target_platform = "EPIC", source_platform = "EPICv2") 
+
+# Exclude identified probe positions from the Beta matrix
+betas_combined_filtered <- betas_combined %>%
+  filter(!rownames(betas_combined) %in% CpGs_to_mask_EPIC_V2_liftover)
+
+rm(betas_combined, CpGs_to_mask_EPIC_V2,CpGs_to_mask_EPIC_V2_liftover)
+```
+
+# QC Sex Inference Verification
+Sex inference was performed to verify reported sample identities. Samples demonstrating discordance between genetically inferred sex and phenotypic metadata were identified and flagged for downstream quality filtering.
+
+```{r}
+# QC: Custom Sex Inference for Merged EPIC v1/v2 Arrays
+#
+# Standard sesame::inferSex expects array-specific manifest formats. 
+# To evaluate the combined dataset (intersected EPIC v1 and v2 probes, mapped 
+# to v1 CpG identifiers), the underlying sex inference function was manually 
+# adapted to target the overlapping sex-linked CpG set.
+# Source implementation: https://github.com/zwdzwd/sesame/blob/devel/R/sex.R
+
+inferSex2 <- function(betas, platform=NULL) {
+  
+  hypoMALE <- c(
+    "cg21983484","cg23696472","cg11673471","cg01742836","cg13574945",
+    "cg08059778","cg24186901","cg26023405","cg15977272","cg13023833",
+    "cg20766178","cg20455959","cg26584339","cg13130271","cg13244998",
+    "cg05872808","cg21290550","cg05806018","cg07861180","cg20015269",
+    "cg12576145","cg10991108","cg02333283","cg16357225","cg25206026",
+    "cg20749341","cg03773146","cg04872051","cg16590821","cg09520212",
+    "cg22221554","cg11152253","cg23429746","cg00813156","cg25132467",
+    "cg16221895","cg09307104","cg15165114","cg18998000","cg00723973",
+    "cg06041068","cg10860619","cg09514431","cg07912337","cg03334316",
+    "cg17399684","cg05534333","cg23493872","cg12413138","cg05374090",
+    "cg27501007","cg08855111","cg21159768","cg16488754","cg12075609",
+    "cg07446674","cg01342901","cg02869694","cg12277627","cg19992190",
+    "cg10717149","cg14191108","cg01869765","cg26505478","cg23685102",
+    "cg02195366","cg06334238","cg02615131","cg15565409","cg15693668",
+    "cg03505772","cg00845806","cg26439324","cg12935118","cg18932686",
+    "cg24264679","cg08782677","cg13649400","cg06779802","cg23554546",
+    "cg23951868","cg00337921","cg08479532","cg00114625","cg03391801",
+    "cg22776211","cg07674503","cg22452543","cg18140045","cg15450782",
+    "cg07674075","cg06510592","cg21137943","cg24479484","cg27501723",
+    "cg20439892","cg18107314","cg08405463","cg09146364","cg16894263")
+  
+  hyperMALE <- c(
+    "cg26359388","cg02540440","cg11049634","cg22874828","cg09182733",
+    "cg01123965","cg15822015","cg05130312","cg17072671","cg22655232",
+    "cg05695959","cg21010298","cg06143713","cg22759686","cg11143827",
+    "cg04303560","cg11717280","cg14372935","cg05533223","cg16405492",
+    "cg15765801","cg08156775","cg24183173","cg21797452","cg03161453",
+    "cg10474871","cg11516614","cg18813691","cg08614574","cg08456555",
+    "cg16440909","cg13326840","cg16822540","cg03801901","cg09039264",
+    "cg01383599","cg14931238","cg04071644","cg22208280","cg05559023",
+    "cg23317607","cg26327984","cg07801607","cg06870560","cg24156613",
+    "cg04101819","cg07422795","cg14261068","cg12622895","cg09192294",
+    "cg26695278","cg12653510","cg03554089","cg11166197","cg04032096",
+    "cg25047306","cg07818713","cg21258987","cg07981033","cg14492530",
+    "cg18157587","cg12030638","cg17498624","cg01816615","cg08723064",
+    "cg05193067","cg27167763","cg15521097","cg25456959","cg16576300",
+    "cg07318999","cg22417678","cg22671388","cg23644934","cg00267352",
+    "cg22223709","cg23698976","cg06780606","cg13920260","cg15861835",
+    "cg10039267","cg12454245","cg22067189","cg00150874","cg08401365",
+    "cg13781721","cg02931660","cg01316390","cg14746118","cg21294096",
+    "cg11871337","cg00408231","cg09641151","cg05226646","cg11291200",
+    "cg01109660","cg23607813","cg04624564","cg07452499","cg18123612")
+  
+  vals <- mean(betas[hyperMALE], na.rm = TRUE) - betas[hypoMALE]
+  dd <- density(na.omit(vals))
+  
+  
+  if (dd$x[which.max(dd$y)] > 0.4) {
+    "Male"
+  } else {
+    "Female"
+  }
+}
+
+# Run sex inference across all samples
+pred.sex = apply(betas_combined_filtered, MARGIN = 2, function(x) {
+  inferSex2(x)
+})
+
+pred.sex_df <- pred.sex %>% 
+  as.data.frame() %>% 
+  rownames_to_column()
+ colnames(pred.sex_df) <- c("Sample_ID", "Sex_predicted")
+
+ # Integrate sex predictions and flag discrepancies
+sample_sheets$sample_sheet_QC_bisulfite_predictSex <- left_join(sample_sheets$sample_sheet_QC_bisulfite, pred.sex_df)
+
+sample_sheets$sample_sheet_QC_bisulfite_predictSex %>% 
+  filter(Sex!= Sex_predicted)
+
+# Flag samples with discordant recorded vs. predicted sex
+sample_sheets$sample_sheet_QC_bisulfite_predictSex <- sample_sheets$sample_sheet_QC_bisulfite_predictSex %>% 
+  mutate(QC_FAIL = ifelse(Sex!= Sex_predicted, "FAIL", QC_FAIL)) 
+
+
+# clean global environment
+rm(pred.sex_df, pred.sex)
+```
+
+
+
+
+# Sample Exclusion and Data Export
+Finally, we remove samples that failed any quality control threshold (array metrics, bisulfite conversion, or sex concordance) and export the cleaned Beta value matrix and sample sheet
+
+```{r}
+# Filter sample sheet to include only QC-passed samples
+sample_sheets$sample_sheet_after_QC <-  sample_sheets$sample_sheet_QC_bisulfite_predictSex %>%
+  filter(is.na(QC_FAIL)) 
+ 
+  
+# Subset Beta matrix to passing samples
+betas_combined_filtered_QCSample <- betas_combined_filtered[,sample_sheets$sample_sheet_after_QC$Sample_ID]
+
+# Export final processed objects
+# only uncoment if you want to overwrite
+# qsave(betas_combined_filtered_QCSample, file = file.path(parameters$PROCESSED_DATA_FOLDER, "betas_V1V2_combined_probeFiltered_SampleQCFiltered.qs")) # only uncoment if you want to overwrite
+# write.table(sample_sheets$sample_sheet_after_QC, file = file.path(parameters$PROCESSED_DATA_FOLDER, "samplesheet_afterQC_onlyMethSamples.tsv"), row.names = FALSE, sep = "\t")
+saveRDS(list("SAMPLESHEET" = sample_sheets$sample_sheet_after_QC), file.path(parameters$PROCESSED_DATA_FOLDER, "samplesheet_afterQC_onlyMethSamples.rds"))
+
+
+```
+
+

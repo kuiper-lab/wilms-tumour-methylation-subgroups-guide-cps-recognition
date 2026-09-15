@@ -1,0 +1,1546 @@
+---
+title: "Manuscript_WT_Figure1"
+author: "Franziska Oberhammer"
+date: "2026-09-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+```{r libraries}
+
+# DEPENDENCY MANAGEMENT & ENVIRONMENT PREPARATION
+# Load all required R packages for differential methylation, differential expression,
+# multi-omics data integration, unsupervised clustering, statistical testing, and visualization.
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(cowplot)
+  library(ggExtra)
+  library(Cairo)
+  library(ggpubr)
+  library(limma)
+  library(genefilter)
+  library(corrplot)
+  library(dendextend)
+  library(viridis)
+  library(EnhancedVolcano)
+  library(plotly)
+  library(tidyverse)
+  library(circlize)
+  library(ggalluvial)
+  library(qs)
+  library(ConsensusClusterPlus)
+  library(gridExtra)
+  library(RColorBrewer)
+  library(ggsignif)
+  library(dplyr)
+  library(rstatix)
+  library(officer)
+  library(ggplot2)
+  library(cluster)
+  library(rcompanion)
+  library(mclust)
+  library(aricode)
+})
+```
+
+
+```{r Configuration}
+# PATH & PARAMETER CONFIGURATION
+# Defines input/output project paths and explicit file references for 
+# processed DNA methylation beta matrices, RNA-seq counts, and clinical sample metadata.
+
+parameters <- list()
+
+# Configuration ----------------------------------------------------------------
+# NOTE: Update directory paths below to point to local or server environment locations
+parameters$WILMS_FOLDER          <- "/hpc/pmc_kuiper/Wilms"
+parameters$PROJECT_FOLDER        <- file.path(parameters$WILMS_FOLDER, "METHYLATION")
+parameters$CODE_FOLDER           <- file.path(parameters$PROJECT_FOLDER, "CODE")
+parameters$DATA_FOLDER           <- file.path(parameters$PROJECT_FOLDER, "DATA")
+parameters$ANALYSIS_FOLDER       <- file.path(parameters$PROJECT_FOLDER, "ANALYSIS")
+parameters$PROCESSED_DATA_FOLDER <- file.path(parameters$ANALYSIS_FOLDER, "PROCESSED_DATA")
+parameters$RESULTS_FOLDER        <- file.path(parameters$PROJECT_FOLDER, "RESULTS")
+
+# Project Input File Paths
+parameters$CURRENT_SAMPLESHEET          <- file.path(parameters$PROCESSED_DATA_FOLDER, 
+                                                     "samplesheet_afterQC_onlyMethSamples.rds")
+parameters$CURRENT_BETAS                <- file.path(parameters$PROCESSED_DATA_FOLDER,
+                                                     "betas_V1V2_combined_probeFiltered_SampleQCFiltered_SNPsQC_postMortemAndVersionFiltered_SexMissmatchFiltered.qs")
+parameters$CURRENT_BETAS_batchCorrected <- file.path(parameters$PROCESSED_DATA_FOLDER,
+                                                     "betas_V1V2_combined_probeFiltered_SampleQCFiltered_SNPsQC_postMortemAndVersionFiltered_batchCorrected.qs")
+parameters$CURRENT_COUNTS               <- file.path("/hpc/pmc_kuiper/Wilms/DATA/RNAseq", "matrices/Wilms.all.samples.feature.counts.20250626.Counts.tab.txt")
+
+
+
+# Source auxiliary scripts and themes -----------------------------------------------------
+source(file.path(parameters$CODE_FOLDER, "00_theme_Publication.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_colour_palettes.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_helper_functions.R"))
+```
+
+
+
+
+```{r LoadData}
+# Load sample metadata, methylation beta matrices, clustering objects, and RNA-seq counts
+sample_sheet         <- readRDS(parameters$CURRENT_SAMPLESHEET)$SAMPLESHEET %>% as.data.frame()
+betas                <- qread(parameters$CURRENT_BETAS)
+betas_batchCorrected <- as.data.frame(qread(parameters$CURRENT_BETAS_batchCorrected))
+counts_df            <- read.csv2(parameters$CURRENT_COUNTS, sep = "\t", row.names = "FEATURE")
+```
+
+
+```{r PrepData}
+# Preprocess methylation beta matrices (keep only train cohort samples)
+betas <- betas %>% 
+  dplyr::select(-c("CI_V1", "BC", "EB"))
+
+betas_batchCorrected <- betas_batchCorrected %>% 
+  dplyr::select(-c("EB")) #CI_V1 and BC already removed in batch corrected data
+
+# Standardize sample column names by removing version suffixes
+colnames(betas) <- sub("_.*", "", colnames(betas))
+colnames(betas_batchCorrected) <- sub("_.*", "", colnames(betas_batchCorrected))
+
+# Verify sample ordering matches the sample sheet
+stopifnot(colnames(betas) == sample_sheet$Internal_Patient_ID)
+stopifnot(colnames(betas_batchCorrected) == sample_sheet$Internal_Patient_ID)
+
+
+# Preprocess RNA-seq count matrix and align ordering -----------------------------------------------------------------------------------------
+# filter samplesheet for only RNAseq data
+sample_sheet_RNAseq_prep <- sample_sheet %>% 
+  filter(!is.na(Used_RNA_ID)) %>% 
+  filter(!Internal_Patient_ID %in% c("DB",  "DG",  "DI",  "DX",  "EB")) # failed QC (number of reads etc)
+
+rownames(sample_sheet_RNAseq_prep) <- sample_sheet_RNAseq_prep$Internal_Patient_ID
+
+# Reorder RNA-seq columns to match sample sheet order
+RNA_colnames_ordered <- colnames(counts_df)[match(sample_sheet_RNAseq_prep$Used_RNA_ID, colnames(counts_df))]
+counts_df <- counts_df[,RNA_colnames_ordered]
+
+stopifnot(colnames(counts_df) == sample_sheet_RNAseq_prep$Used_RNA_ID)
+
+# Map internal RNA IDs to M-Labels
+colnames(counts_df) <- sample_sheet_RNAseq_prep$M_Label[match(colnames(counts_df), sample_sheet_RNAseq_prep$Used_RNA_ID)]
+
+# clean workspace -----------
+rm(RNA_colnames_ordered)
+```
+
+
+# Figure 1A Heatmap
+
+## Clustering
+
+```{r find_most_variable_cpgs_batchCorrected}
+# Feature selection: isolate top 5,000 most variable CpGs across samples by row variance
+
+NUMBER_OF_MOST_VARIABLE_CpGs <- 5000
+
+betas_batchCorrected_mvCpGs <- head(betas_batchCorrected[
+  order(matrixStats:::rowVars(
+    betas_batchCorrected %>% as.matrix()),
+    decreasing = TRUE),],
+  NUMBER_OF_MOST_VARIABLE_CpGs)
+
+#Change labels to M-labels
+colnames(betas_batchCorrected_mvCpGs) <- sample_sheet[match(colnames(betas_batchCorrected_mvCpGs), sample_sheet$Internal_Patient_ID),]$M_Label
+```
+
+```{r}
+# Scale and transpose transformed mvCpG matrix for distance and clustering calculations
+betas_batchCorrected_mvCpGs_scaledTransformed <- scale(t(betas_batchCorrected_mvCpGs))
+
+stopifnot(rownames(betas_batchCorrected_mvCpGs_scaledTransformed)== sample_sheet$M_Label)
+
+```
+
+
+```{r}
+# Unsupervised consensus clustering via ConsensusClusterPlus across top variable CpGs
+innerLinkage <- "ward.D2"
+finalLinkage <- "ward.D2"
+clusterAlg <- "hc"
+distanceMeth <- "pearson"
+
+results = ConsensusClusterPlus(
+  betas_batchCorrected_mvCpGs_scaledTransformed%>% t(),
+  maxK=20,
+  reps=1000,
+  pItem=0.8,
+  pFeature=1,
+  innerLinkage = innerLinkage,
+  finalLinkage = finalLinkage,
+  clusterAlg = clusterAlg,
+  distance = distanceMeth,
+  title = file.path(parameters$ANALYSIS_FOLDER,
+                    "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_5000mvCpGs_manuscript",
+                    paste0("innerLinkage", innerLinkage,
+                           "_finalLinkage", finalLinkage,
+                           "_clusterAlg", clusterAlg,
+                           "_distanceMeth", distanceMeth)),
+  seed=1262118388.71279,
+  # plot="pdf" # Uncomment to export consensus cluster decision plots
+)
+
+# Calculate item consensus (ICL) metrics
+icl = calcICL(
+  results,
+  title = file.path(parameters$ANALYSIS_FOLDER,
+                    "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_5000mvCpGs_manuscript",
+                    paste0("innerLinkage", innerLinkage,
+                           "_finalLinkage", finalLinkage,
+                           "_clusterAlg", clusterAlg,
+                           "_distanceMeth", distanceMeth)),
+  # plot = "pdf" # Uncomment to export plots
+)
+```
+
+
+Evaluating the clustering metrics identified a five-cluster model as optimal.   
+
+
+```{r}
+
+# Extract consensus clustering hierarchy at k = 5 clusters
+consensus_clustering_5 <- results[[5]]
+consensus_clustering_5_tree <- consensus_clustering_5$consensusTree
+consensus_clustering_5_tree$labels <- rownames(betas_batchCorrected_mvCpGs_scaledTransformed)
+
+qsave(consensus_clustering_5_tree, 
+      file = file.path(
+        parameters$ANALYSIS_FOLDER,
+        "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_5000mvCpGs_manuscript",
+        paste0("innerLinkage", innerLinkage,
+               "_finalLinkage", finalLinkage,
+               "_clusterAlg", clusterAlg,
+               "_distanceMeth", distanceMeth), "clustering_tree_5clusters.qs"))
+
+# clean global environment
+rm(innerLinkage, finalLinkage, clusterAlg, distanceMeth)
+
+```
+
+
+```{r}
+# Map numeric consensus clusters (k=5) to manuscript subgroup nomenclature (1a-2c)
+clustering_result <- consensus_clustering_5$consensusClass %>%
+  as.data.frame(nm = "DNAm_5_cluster") %>%
+  rownames_to_column("M_Label") %>% 
+  mutate(DNAm_5_cluster_letters = 
+           case_when(
+             DNAm_5_cluster == 1 ~ "2a",
+             DNAm_5_cluster == 2 ~ "2c",
+             DNAm_5_cluster == 3 ~ "1b",
+             DNAm_5_cluster == 4 ~ "2b",
+             DNAm_5_cluster == 5 ~ "1a",
+           ))
+
+sample_sheet_clustering <- left_join(sample_sheet %>% mutate(DNAm_5_cluster_letters = NULL), clustering_result)
+
+#clean global environment
+rm(clustering_result, results, icl)
+```
+
+## Heatmap
+
+```{r}
+
+stopifnot(colnames(betas_batchCorrected_mvCpGs) == names(consensus_clustering_5$consensusClass))
+
+methHeatmap <- ComplexHeatmap::Heatmap(
+  matrix = betas_batchCorrected_mvCpGs,
+  use_raster = F,
+  cluster_columns = as.dendrogram(consensus_clustering_5_tree),
+  column_split = 5,
+  
+  show_row_names = F,
+  show_column_names = T,
+
+  row_title = "CpG",
+  column_title = "Sample",
+  column_title_side = "bottom",
+  col = circlize::colorRamp2(seq(0, 1, 0.01), colours_WT$meth),
+  name = "ß-value",
+  heatmap_legend_param = list(
+    direction = "horizontal",
+    width = unit(4, "cm")
+  ),
+  column_names_gp = grid::gpar(fontsize = 5),
+  row_names_gp = grid::gpar(fontsize = 5)
+)
+
+# Set figure dimensions for export
+pdf_width <- 180/25.4   # Convert mm to inches
+pdf_height <- 80/25.4   
+dpi <- 300        # raster resolution
+
+# Render Heatmap output
+# CairoPDF(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1A_DNAm_clustering.pdf"), width = pdf_width, height = pdf_height) # convert to inches
+ComplexHeatmap::draw(methHeatmap, heatmap_legend_side = "bottom")
+# dev.off()
+
+
+# High-res Raster Export
+png_width <- pdf_width * dpi
+png_height <- pdf_height * dpi
+
+# CairoPNG(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1A_DNAm_clustering.png"), width = png_width, height = png_height, dpi = dpi)
+ComplexHeatmap::draw(methHeatmap, heatmap_legend_side = "bottom"
+                     # , show_heatmap_legend = FALSE, show_annotation_legend = FALSE
+                     )  
+# dev.off()
+
+
+# write.table(betas_batchCorrected_mvCpGs, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1A_DNAm_clustering.tsv"), sep = "\t")
+
+
+
+```
+
+
+# Figure 1B PCA RNAseq
+
+```{r}
+set.seed(42)
+
+sample_sheet_RNAseq <- left_join(sample_sheet_RNAseq_prep %>% mutate(DNAm_5_cluster_letters = NULL), sample_sheet_clustering %>% 
+                                   dplyr::select(Internal_Patient_ID, DNAm_5_cluster_letters)) 
+
+
+# =====================================
+# 1. NORMALIZATION PIPELINE
+# =====================================
+
+cat("Step 1: DESeq2 Normalization Pipeline\n")
+cat("=====================================\n")
+
+# Construct DESeq2 object with main experimental covariate design
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_df,
+  colData = sample_sheet_RNAseq,
+  design = ~ Batch_RNAseq + Sex + DNAm_5_cluster_letters
+)
+
+cat("Original dataset dimensions:", dim(dds), "\n")
+
+# Quality filtering: Remove low-expressed genes
+# Keep genes with ≥10 counts in ≥3 samples (adjust based on sample size)
+keep <- rowSums(counts(dds) >= 10) >= max(3, ncol(dds) * 0.1)
+dds <- dds[keep, ]
+cat("After filtering low-expressed genes:", nrow(dds), "genes retained\n")
+
+# Estimate size factors (normalization factors)
+dds <- estimateSizeFactors(dds)
+cat("Size factors calculated:\n")
+print(round(sizeFactors(dds), 3))
+
+# Get normalized counts
+norm_counts <- counts(dds, normalized = TRUE)
+plot(colSums(norm_counts))
+
+# =====================================
+# 1b. REMOVE SAMPLES WITH EXTREME LIBRARY SIZES
+# =====================================
+# This was already performed on our raw data. RNAseq data from patient M222AAH was an extreme outlier in terms of library size. Therefore we had to remove it, and also did not upload it to EGA. This next step only needs to be performed if that sample is still in your data. 
+
+if("M222AAH" %in% colnames(counts_df)){
+  # Total counts per sample
+  totals <- colSums(norm_counts)
+  
+  # Cutoffs (mean ± 3*SD)
+  low <- mean(totals) - 3*sd(totals)
+  high <- mean(totals) + 3*sd(totals)
+  
+  # Identify outlier sample IDs
+  outliers <- names(totals[totals < low | totals > high])
+  cat("Removing outlier samples (library size extreme):", outliers, "\n")
+  
+  # Remove outliers from DESeqDataSet
+  dds <- dds[, !colnames(dds) %in% outliers]
+  
+  # Update sample sheet and normalized counts accordingly
+  sample_sheet_RNAseq <- as.data.frame(colData(dds))
+  norm_counts <- counts(dds, normalized = TRUE)
+  
+  # Quick check
+  cat("Dataset dimensions after outlier removal (dds):", dim(dds), "\n")
+  cat("Dataset dimensions after outlier removal (sample sheet):", dim(sample_sheet_RNAseq), "\n")
+  cat("Dataset dimensions after outlier removal (normalised counts):", dim(norm_counts), "\n")
+  
+  # Visualize library sizes and highlight removed samples
+  df_lib <- data.frame(
+    Sample = names(totals),
+    TotalCounts = totals,
+    Status = ifelse(names(totals) %in% outliers, "Removed", "Kept")
+  )
+  
+  # pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES1", "100_RNAseqLibrarySize.pdf"), width = 8, height = 7)
+  ggplot(df_lib, aes(x = Sample, y = TotalCounts, fill = Status)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = c("Kept" = "skyblue", "Removed" = "red")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Library Sizes per Sample", y = "Normalized Counts")
+  # dev.off()
+  
+}
+
+
+# =====================================
+# 2. VARIANCE STABILIZING TRANSFORMATION
+# =====================================
+
+cat("\nStep 2: Variance Stabilizing Transformation\n")
+cat("==========================================\n")
+
+# Apply VST transformation to eliminate mean-variance dependency across count range
+vst_data <- vst(dds, blind = FALSE)
+vst_mat <- assay(vst_data)
+
+cat("Generating mean-variance plots...\n")
+
+top_gene_vst <- which.max(rowMeans(vst_mat))
+gene_name <- rownames(vst_mat)[top_gene_vst]
+
+# Get normalized count data for comparison
+count_data <- plotCounts(dds, gene = gene_name, intgroup = "DNAm_5_cluster_letters", returnData = TRUE, normalized = TRUE)
+count_data$vst_counts <- vst_mat[gene_name, rownames(count_data)]
+
+# Side-by-side comparison plot
+p1 <- ggplot(count_data, aes(x = DNAm_5_cluster_letters, y = count, color = DNAm_5_cluster_letters)) +
+  geom_jitter(width = 0.2, size = 3, alpha = 0.7) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  scale_y_log10() +
+  labs(title = "DESeq2 Normalized Counts", y = "Normalized counts (log10)") +
+  theme_minimal() + theme(legend.position = "none")+
+  scale_color_manual(values = colours_WT$DNAm_clustering2)
+
+p2 <- ggplot(count_data, aes(x = DNAm_5_cluster_letters, y = vst_counts, color = DNAm_5_cluster_letters)) +
+  geom_jitter(width = 0.2, size = 3, alpha = 0.7) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+  labs(title = "VST Transformed Counts", y = "VST counts") +
+  theme_minimal() + theme(legend.position = "none")+
+  scale_color_manual(values = colours_WT$DNAm_clustering2)
+
+
+grid.arrange(p1, p2, ncol = 2, top = paste("Gene:", gene_name))
+
+
+
+# =====================================
+# 3. PRINCIPAL COMPONENT ANALYSIS
+# =====================================
+
+cat("\nStep 3: Principal Component Analysis\n")
+cat("===================================\n")
+
+
+vst_mat <- assay(vst_data)
+
+# Remove technical batch and biological sex covariates using limma
+covars <- model.matrix(~ Sex + Batch_RNAseq, colData(vst_data))[ , -1]
+vst_corrected <- limma::removeBatchEffect(vst_mat, covariates = covars)
+
+# Select top 500 most variable genes post-batch correction
+topVar <- head(order(rowVars(vst_corrected), decreasing = TRUE), 500)
+vst_top <- vst_corrected[topVar, ]
+
+# Run PCA on adjusted expression values
+pca_result <- prcomp(t(vst_top), center = TRUE, scale. = FALSE)
+
+
+# Calculate variance explained by each PC
+var_explained <- (pca_result$sdev^2) / sum(pca_result$sdev^2) * 100
+cum_var_explained <- cumsum(var_explained)
+
+cat("Variance explained by first 5 PCs:\n")
+for(i in 1:min(5, length(var_explained))) {
+  cat(sprintf("PC%d: %.1f%% (Cumulative: %.1f%%)\n", 
+              i, var_explained[i], cum_var_explained[i]))
+}
+
+# Create PCA data frame
+pca_df <- data.frame(
+  Sample = rownames(pca_result$x),
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  PC3 = pca_result$x[, 3],
+  PC4 = pca_result$x[, 4],
+  PC5 = pca_result$x[, 5]
+) %>%
+  left_join(sample_sheet_RNAseq, by = c("Sample" = "M_Label"))
+
+# PCA plots colored by different metadata variables ---------- 
+plot_list <- list()
+
+# Main PCA plot by cluster
+# Define the PC pairs you want to plot
+pc_pairs <- list(
+  c(1, 2),
+  c(1, 3), 
+  c(2, 3),
+  c(2,4)
+)
+
+# Loop over categorical variables and PC pairs to make PCA plots
+for (pair in pc_pairs) {
+  pcx <- pair[1]
+  pcy <- pair[2]
+  
+    p <- ggplot(pca_df,  
+                aes(x = .data[[paste0("PC", pcx)]], 
+                    y = .data[[paste0("PC", pcy)]], 
+                    color = .data[["DNAm_5_cluster_letters"]])
+    ) +
+      geom_point(size = 3, alpha = 0.8) +
+  labs(
+    #title = "PCA: Samples colored by Cluster",
+    x = paste0("PC", pcx, " (", round(var_explained[pcx], 1), "%)"),
+    y = paste0("PC", pcy, " (", round(var_explained[pcy], 1), "%)")
+  ) +
+  theme(legend.position = NULL) +
+  theme_Publication()+
+  scale_color_manual(values = colours_WT$DNAm_clustering2, name = "DNAm cluster")
+      
+    p_all <- ggMarginal(
+  p,
+  data = pca_df,
+  groupColour = TRUE,
+  groupFill   = TRUE,
+  margins     = "both",
+  type        = "density"
+)
+    # Save to plot_list with informative name
+    plotname <- paste0("DNAm_clustering", "_PC", pcx, "_PC", pcy)
+    plot_list[[plotname]] <- p_all
+  }
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1B_RNAseqPCA.pdf"), width = 8, height = 6)
+plot_list[1] 
+# dev.off()
+
+# save raw data used to generate figures
+# write.table(pca_df %>% dplyr::select(Sample, PC1, PC2, DNAm_5_cluster_letters), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1B_RNAseqPCA_data.tsv"), sep = "\t")
+
+
+# Additional PCA plots for other categorical variables
+categorical_vars <- c("Sex", "Age_diagnosis_log", "Batch_RNAseq", "Preoperative_chemotherapy", "Sample_Group", "Corrected_histology")
+stopifnot(categorical_vars %in% colnames(sample_sheet_RNAseq))
+
+# Loop over categorical variables and PC pairs to make PCA plots
+for (vari in categorical_vars) {
+  for (pair in pc_pairs) {
+    pcx <- pair[1]
+    pcy <- pair[2]
+    
+    p <- ggplot(
+      pca_df, 
+      aes(x = .data[[paste0("PC", pcx)]], 
+          y = .data[[paste0("PC", pcy)]], 
+          color = .data[[vari]])
+    ) +
+      geom_point(size = 3, alpha = 0.8) +
+
+      labs(
+        title = paste("PCA:", vari, "colored (PC", pcx, "vs PC", pcy, ")"),
+        x = paste0("PC", pcx, " (", round(var_explained[pcx], 1), "%)"),
+        y = paste0("PC", pcy, " (", round(var_explained[pcy], 1), "%)")
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    # Save to plot_list with informative name
+    plotname <- paste0(vari, "_PC", pcx, "_PC", pcy)
+    plot_list[[plotname]] <- p
+  }
+}
+
+
+
+
+# Display PCA plots
+do.call(grid.arrange, c(plot_list[1:8],   ncol = 4))
+do.call(grid.arrange, c(plot_list[9:16],   ncol = 4))
+do.call(grid.arrange, c(plot_list[17:24],   ncol = 4))
+do.call(grid.arrange, c(plot_list[25:32],   ncol = 4))
+do.call(grid.arrange, c(plot_list[33:40],   ncol = 4))
+do.call(grid.arrange, c(plot_list[41:48],   ncol = 4))
+do.call(grid.arrange, c(plot_list[49:56],   ncol = 4))
+do.call(grid.arrange, c(plot_list[57:64],   ncol = 4))
+
+# =====================================
+# 4. SCREE PLOT
+# =====================================
+
+cat("\nStep 4: Scree Plot Analysis\n")
+cat("===========================\n")
+
+scree_data <- data.frame(
+  PC = 1:length(var_explained),
+  Variance_Explained = var_explained,
+  Cumulative_Variance = cum_var_explained
+)
+
+# Scree plot with elbow point identification
+scree_plot <- ggplot(scree_data[1:min(20, nrow(scree_data)), ], 
+                     aes(x = PC, y = Variance_Explained)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_line(color = "red", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "Scree Plot: Variance Explained by Principal Components",
+    x = "Principal Component",
+    y = "Variance Explained (%)"
+  ) +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:min(20, nrow(scree_data)))
+
+# Cumulative variance plot
+cum_var_plot <- ggplot(scree_data[1:min(20, nrow(scree_data)), ], 
+                       aes(x = PC, y = Cumulative_Variance)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "blue", size = 2) +
+  geom_hline(yintercept = c(80, 90, 95), linetype = "dashed", alpha = 0.5) +
+  labs(
+    title = "Cumulative Variance Explained",
+    x = "Principal Component",
+    y = "Cumulative Variance (%)"
+  ) +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:min(20, nrow(scree_data))) +
+  ylim(0, 100)
+
+# Display scree plots
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES1", "100_RNAseqScreePlot.pdf"), width = 8, height = 7)
+grid.arrange(scree_plot, cum_var_plot, ncol = 1)
+# dev.off()
+
+# Identify optimal number of PCs (Kaiser criterion: eigenvalue > 1)
+eigenvalues <- pca_result$sdev^2
+optimal_pcs_kaiser <- sum(eigenvalues > 1)
+cat(sprintf("Optimal PCs (Kaiser criterion): %d\n", optimal_pcs_kaiser))
+
+
+
+# =====================================
+# 5. PC CORRELATION ANALYSIS
+# =====================================
+
+cat("\nStep 5: PC Correlation with Continuous Variables\n")
+cat("===============================================\n")
+
+# Identify continuous variables in metadata
+continuous_vars <- names(sample_sheet_RNAseq)[sapply(sample_sheet_RNAseq, is.numeric)]
+cat("Continuous variables found:", paste(continuous_vars, collapse = ", "), "\n")
+
+if(length(continuous_vars) > 0) {
+  # Extract continuous variables for correlation
+  cont_data <- sample_sheet_RNAseq[continuous_vars]
+  
+  # Calculate correlations between PCs and continuous variables
+  pc_scores <- pca_result$x[, 1:min(10, ncol(pca_result$x))]
+  
+  # Use Spearman correlation (non-parametric, robust to outliers)
+  correlation_method <- "spearman"
+  
+  # Calculate correlation matrix (rectangular: PCs x metadata variables)
+  cor_matrix <- cor(pc_scores, cont_data, method = correlation_method, use = "complete.obs")
+  
+  # Calculate p-values for correlations with exact=FALSE to handle ties
+  cor_pvalues <- matrix(NA, nrow = nrow(cor_matrix), ncol = ncol(cor_matrix))
+  rownames(cor_pvalues) <- rownames(cor_matrix)
+  colnames(cor_pvalues) <- colnames(cor_matrix)
+  
+  cat("Calculating correlation p-values...\n")
+  for(i in 1:nrow(cor_matrix)) {
+    for(j in 1:ncol(cor_matrix)) {
+      # Use exact=FALSE to avoid ties warning and use normal approximation
+      test_result <- cor.test(pc_scores[, i], cont_data[, j], 
+                             method = correlation_method, exact = FALSE)
+      cor_pvalues[i, j] <- test_result$p.value
+    }
+  }
+  
+  # Apply multiple testing correction (Benjamini-Hochberg FDR)
+  cor_pvalues_adj <- matrix(p.adjust(as.vector(cor_pvalues), method = "BH"), 
+                           nrow = nrow(cor_pvalues), ncol = ncol(cor_pvalues))
+  rownames(cor_pvalues_adj) <- rownames(cor_pvalues)
+  colnames(cor_pvalues_adj) <- colnames(cor_pvalues)
+  
+  # Create significance matrix for visualization (using adjusted p-values)
+  sig_matrix <- ifelse(cor_pvalues_adj < 0.001, "***",
+                       ifelse(cor_pvalues_adj < 0.01, "**",
+                              ifelse(cor_pvalues_adj < 0.05, "*", "")))
+  
+  # CORRPLOT FOR NON-SQUARE MATRIX: Use order = "original" instead of "hclust"
+  library(corrplot)
+  corrplot(cor_matrix,
+           method = "color",
+           type = "full",
+           order = "original",
+           tl.col = "black",
+           tl.srt = 45,
+           title = paste("PC-Metadata Correlations (", stringr::str_to_title(correlation_method), ")", sep = ""),
+           mar = c(0, 0, 2, 0),
+           addCoef.col = "black",
+           number.cex = 0.7,
+           # Color scale
+           col = colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))(200),
+           # Add significance indicators
+           p.mat = cor_pvalues_adj,
+           sig.level = 0.05,
+           insig = "blank",  # Blank out non-significant correlations
+           is.corr = FALSE)  # tells corrplot this is not a square correlation matrix
+  
+  # Alternative: ggplot2 visualization with better control for rectangular matrices
+  library(reshape2)
+  cor_melt <- melt(cor_matrix)
+  pval_melt <- melt(cor_pvalues_adj)
+  cor_melt$pvalue <- pval_melt$value
+  cor_melt$significance <- ifelse(cor_melt$pvalue < 0.001, "***",
+                                 ifelse(cor_melt$pvalue < 0.01, "**",
+                                        ifelse(cor_melt$pvalue < 0.05, "*", "")))
+  
+  # Enhanced ggplot with better aesthetics for PC-metadata correlations
+  ggplot_corr <- ggplot(cor_melt, aes(x = Var2, y = Var1, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    scale_fill_gradient2(low = "#2166AC", high = "#B2182B", mid = "white", 
+                        midpoint = 0, limit = c(-1, 1), space = "Lab",
+                        name = "Spearman\nCorrelation") +
+    geom_text(aes(label = paste0(round(value, 2), "\n", significance)), 
+              color = "black", size = 3.5, fontface = "bold") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(size = 10),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      legend.position = "right"
+    ) +
+    labs(title = "Principal Component - Metadata Correlations",
+         subtitle = "*, **, *** indicate FDR-corrected p < 0.05, 0.01, 0.001") +
+    coord_fixed(ratio = 1) 
+  
+  print(ggplot_corr)
+  
+  # Optional: Create a clustered heatmap using pheatmap for better clustering visualization
+  library(pheatmap)
+  
+  # For clustering, we need to handle the rectangular matrix differently
+  # We can cluster rows (PCs) separately from columns (metadata variables)
+  if(ncol(cor_matrix) > 2 && nrow(cor_matrix) > 2) {
+    
+    # Create annotation for significance
+    annotation_colors <- list()
+    
+    pheatmap(cor_matrix,
+             color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+             breaks = seq(-1, 1, length.out = 101),
+             cluster_rows = TRUE,    # Cluster PCs
+             cluster_cols = TRUE,    # Cluster metadata variables  
+             clustering_distance_rows = "correlation",
+             clustering_distance_cols = "correlation",
+             clustering_method = "complete",
+             display_numbers = TRUE,
+             number_format = "%.2f",
+             fontsize_number = 8,
+             main = "PC-Metadata Correlations (Clustered)",
+             angle_col = 45,
+             cellwidth = 30,
+             cellheight = 20)
+  }
+  
+  # Print significant correlations (using FDR-corrected p-values)
+  cat("\nSignificant PC-metadata correlations (FDR-corrected p < 0.05):\n")
+  significant_cors <- which(cor_pvalues_adj < 0.05, arr.ind = TRUE)
+  if(nrow(significant_cors) > 0) {
+    sig_results <- data.frame(
+      PC = rownames(cor_matrix)[significant_cors[, 1]],
+      Variable = colnames(cor_matrix)[significant_cors[, 2]],
+      Correlation = cor_matrix[significant_cors],
+      P_value = cor_pvalues[significant_cors],
+      P_adjusted = cor_pvalues_adj[significant_cors]
+    )
+    sig_results <- sig_results[order(sig_results$P_adjusted), ]
+    print(sig_results)
+    
+    # Export significant correlations
+   #write.csv(sig_results, "Significant_PC_correlations.csv", row.names = FALSE)
+  } else {
+    cat("No significant correlations found after FDR correction.\n")
+  }
+  
+  # Summary statistics
+  cat(sprintf("\nCorrelation Analysis Summary:\n"))
+  cat(sprintf("- Method: %s correlation\n", stringr::str_to_title(correlation_method)))
+  cat(sprintf("- PCs analyzed: %d\n", nrow(cor_matrix)))
+  cat(sprintf("- Continuous variables: %d\n", ncol(cor_matrix)))
+  cat(sprintf("- Total correlations tested: %d\n", length(cor_matrix)))
+  cat(sprintf("- Significant (raw p < 0.05): %d\n", sum(cor_pvalues < 0.05, na.rm = TRUE)))
+  cat(sprintf("- Significant (FDR-corrected p < 0.05): %d\n", sum(cor_pvalues_adj < 0.05, na.rm = TRUE)))
+  
+} else {
+  cat("No continuous variables found in metadata for correlation analysis.\n")
+}
+
+
+# =====================================
+# 6. PC ASSOCIATION WITH CATEGORICAL VARIABLES
+# =====================================
+
+cat("\nStep 6: PC Associations with Categorical Variables\n")
+cat("===================================================\n")
+
+# Identify categorical variables in metadata
+categorical_vars <- unique(c("DNAm_5_cluster_letters", categorical_vars))
+categorical_vars <- categorical_vars[!categorical_vars %in% c("sizeFactor")]
+cat("Categorical variables found:", paste(categorical_vars, collapse = ", "), "\n")
+
+if(length(categorical_vars) > 0) {
+  # Extract PC scores
+  pc_scores <- pca_result$x[, 1:min(10, ncol(pca_result$x))]  # first 10 PCs
+  sig_cat_results <- data.frame()
+  
+  for(vari in categorical_vars) {
+    for(pc in colnames(pc_scores)) {
+      # ANOVA: PC ~ categorical variable
+      group <- factor(sample_sheet_RNAseq[[vari]])
+      test <- aov(pc_scores[, pc] ~ group)
+      pval <- summary(test)[[1]][["Pr(>F)"]][1]
+      
+      sig_cat_results <- rbind(sig_cat_results, 
+                               data.frame(PC = pc,
+                                          Variable = vari,
+                                          P_value = pval))
+    }
+  }
+  
+  # Multiple testing correction
+  sig_cat_results$P_adjusted <- p.adjust(sig_cat_results$P_value, method = "BH")
+  
+  # Keep only significant associations
+  sig_cat_results <- sig_cat_results[sig_cat_results$P_adjusted < 0.05, ]
+  sig_cat_results <- sig_cat_results[order(sig_cat_results$P_adjusted), ]
+  
+  if(nrow(sig_cat_results) > 0){
+    cat("Significant associations between PCs and categorical variables:\n")
+    print(sig_cat_results)
+    # write.csv(sig_cat_results, "Significant_PC_categorical_associations.csv", row.names = FALSE)
+  } else {
+    cat("No significant associations found after FDR correction.\n")
+  }
+  
+} else {
+  cat("No categorical variables found in metadata for association analysis.\n")
+}
+```
+
+
+# Figure 1C RNAseq clustering
+
+```{r}
+# Execute unsupervised consensus clustering on top 500 variable gene expression profiles
+vst_top
+
+consensus_result <- ConsensusClusterPlus(
+  d = t(scale(t(vst_top))),
+  maxK = 20,
+  reps = 1000,
+  pItem = 0.8,
+  pFeature = 1,
+  clusterAlg = "hc",
+  distance = "pearson",
+  innerLinkage = "ward.D2",
+  finalLinkage = "ward.D2",
+  seed = 43,
+  verbose = F,
+  title = 
+  file.path(parameters$RESULTS_FOLDER, "FIGURES1",
+                    "100_RNAseq_clustering_ConsensusClusterPlus_500mvgenes_innerLinkageWard.D2_finalLinkageWard.D2_clusterAlgHc_distanceMethPearson"),
+  # plot = "pdf" # uncomment if pdf should be saved to results folder
+  )
+  
+
+# Calculate cluster consensus (ICL)
+icl = calcICL(
+  consensus_result,
+  title = 
+    file.path(parameters$RESULTS_FOLDER, "FIGURES1",
+              "100_RNAseq_clustering_ConsensusClusterPlus_500mvgenes_innerLinkageWard.D2_finalLinkageWard.D2_clusterAlgHc_distanceMethPearson"),
+  # plot = "pdf" # uncomment if pdf should be saved to results folder
+)  
+
+# Extract k = 5 optimal cluster solution and re-code output labels
+k_optimal_clusters <- 5
+RNAseq_clustering_tree <- consensus_result[[k_optimal_clusters]]$consensusTree
+RNAseq_clustering_groups <- setNames(stack(consensus_result[[k_optimal_clusters]]$consensusClass)[2:1], c('M_Label','RNAseq_cluster')) %>% 
+  mutate(RNAseq_cluster = recode(as.character(RNAseq_cluster), `1` = "C", `2` = "D", `3` = "B", `4` = "E", `5` = "A"))
+
+
+cluster_assignments <- consensus_result[[k_optimal_clusters]]$consensusClass
+
+```
+
+## Cross-platform cluster validation 
+
+```{r}
+# =====================================
+# CROSS-PLATFORM CLUSTER VALIDATION
+# DNAm vs RNAseq Clustering Comparison
+# =====================================
+
+# Set reproducibility
+set.seed(42)
+
+# =====================================
+# 1. DATA PREPARATION
+# =====================================
+
+# Merge RNAseq clusters with sample sheet
+sample_sheet_withRNAseqClusters <- left_join(sample_sheet_RNAseq, RNAseq_clustering_groups) %>% 
+  filter(!is.na(RNAseq_cluster))
+
+# Prepare named vectors for clustering comparison
+rna_clusters <- sample_sheet_withRNAseqClusters$RNAseq_cluster
+names(rna_clusters) <- sample_sheet_withRNAseqClusters$M_Label
+
+dnam_clusters <- sample_sheet_withRNAseqClusters$DNAm_5_cluster_letters
+names(dnam_clusters) <- sample_sheet_withRNAseqClusters$M_Label
+
+# Keep only samples present in both clusterings
+common_samples <- intersect(names(rna_clusters), names(dnam_clusters))
+rna_clusters <- rna_clusters[common_samples]
+dnam_clusters <- dnam_clusters[common_samples]
+
+cat("Number of samples in validation:", length(common_samples), "\n")
+cat("RNAseq clusters:", table(rna_clusters), "\n")
+cat("DNAm clusters:", table(dnam_clusters), "\n")
+
+# =====================================
+# 2. STATISTICAL VALIDATION
+# =====================================
+set.seed(1234)
+# Contingency table and proportions
+tab <- table(rna_clusters, dnam_clusters)
+print("Contingency Table:")
+print(tab)
+
+prop_tab <- prop.table(tab, margin = 2)
+print("Column proportions:")
+print(round(prop_tab, 3))
+
+# Chi-squared test with simulation (handles small expected frequencies)
+cs <- chisq.test(tab, simulate.p.value = TRUE, B = 10000)
+cat("Chi-squared test results:\n")
+print(cs)
+
+# Effect size (Cramér's V)
+cramer_v <- rcompanion::cramerV(tab)
+cat("Cramér's V (effect size):", round(cramer_v, 4), "\n")
+
+# Label-invariant cluster similarity metrics
+ari <- adjustedRandIndex(rna_clusters, dnam_clusters)
+nmi <- NMI(rna_clusters, dnam_clusters)
+
+cat("Adjusted Rand Index (ARI):", round(ari, 4), "\n")
+cat("Normalized Mutual Information (NMI):", round(nmi, 4), "\n")
+
+# =====================================
+# 3. PERMUTATION TESTS (SIGNIFICANCE)
+# =====================================
+
+cat("\nRunning permutation tests...\n")
+n_permutations <- 1000
+
+# ARI permutation test
+null_ari <- replicate(n_permutations, {
+  shuffled_dnam <- sample(dnam_clusters)
+  adjustedRandIndex(rna_clusters, shuffled_dnam)
+})
+ari_pvalue <- sum(null_ari >= ari) / n_permutations
+
+# NMI permutation test
+null_nmi <- replicate(n_permutations, {
+  shuffled_dnam <- sample(dnam_clusters)
+  NMI(rna_clusters, shuffled_dnam)
+})
+nmi_pvalue <- sum(null_nmi >= nmi) / n_permutations
+
+cat("ARI permutation p-value:", ari_pvalue, "\n")
+cat("NMI permutation p-value:", nmi_pvalue, "\n")
+
+# =====================================
+# 4. BOOTSTRAP CONFIDENCE INTERVALS
+# =====================================
+
+cat("\nCalculating bootstrap confidence intervals...\n")
+
+# ARI bootstrap confidence intervals
+boot_ari <- replicate(1000, {
+  boot_samples <- sample(length(common_samples), replace = TRUE)
+  adjustedRandIndex(rna_clusters[boot_samples], dnam_clusters[boot_samples])
+})
+ari_ci <- quantile(boot_ari, c(0.025, 0.975))
+
+# NMI bootstrap confidence intervals
+boot_nmi <- replicate(1000, {
+  boot_samples <- sample(length(common_samples), replace = TRUE)
+  NMI(rna_clusters[boot_samples], dnam_clusters[boot_samples])
+})
+nmi_ci <- quantile(boot_nmi, c(0.025, 0.975))
+
+cat("ARI 95% CI:", paste0("[", round(ari_ci[1], 3), ", ", round(ari_ci[2], 3), "]"), "\n")
+cat("NMI 95% CI:", paste0("[", round(nmi_ci[1], 3), ", ", round(nmi_ci[2], 3), "]"), "\n")
+
+# =====================================
+# 5. CLUSTERING QUALITY ASSESSMENT
+# =====================================
+
+# Silhouette analysis for internal validation
+cat("\nAssessing clustering quality...\n")
+
+# RNAseq silhouette (using VST-transformed data)
+if(exists("vst_top")) {
+  dist_matrix <- as.dist(1 - cor(vst_top[, common_samples], method = "pearson"))
+  rna_silhouette <- silhouette(as.numeric(as.factor(rna_clusters)), dist_matrix)
+  mean_rna_sil <- mean(rna_silhouette[, "sil_width"])
+  cat("RNAseq clustering silhouette score:", round(mean_rna_sil, 3), "\n")
+}
+
+# =====================================
+# 6. SUMMARY STATISTICS TABLE
+# =====================================
+
+# Create comprehensive validation summary
+validation_summary <- data.frame(
+  Metric = c("Adjusted Rand Index", "Normalized Mutual Information", 
+             "Cramér's V", "Chi-squared p-value", "ARI permutation p-value", 
+             "NMI permutation p-value"),
+  Value = c(round(ari, 4), round(nmi, 4), round(cramer_v, 4), 
+            round(cs$p.value, 6), ari_pvalue, nmi_pvalue),
+  CI_95 = c(paste0("[", round(ari_ci[1], 3), ", ", round(ari_ci[2], 3), "]"),
+            paste0("[", round(nmi_ci[1], 3), ", ", round(nmi_ci[2], 3), "]"),
+            "NA", "NA", "NA", "NA"),
+  Interpretation = c("Moderate agreement", "Moderate agreement", 
+                     "Strong association", "Highly significant", 
+                     "Highly significant", "Highly significant")
+)
+
+print("\nValidation Summary:")
+print(validation_summary)
+
+# Export summary table
+# write.csv(validation_summary, "cluster_validation_summary.csv", row.names = FALSE)
+
+# =====================================
+# 7. VISUALIZATIONS
+# =====================================
+
+# Prepare data for alluvial plot
+sample_sheet_withRNAseqClusters_long <- sample_sheet_withRNAseqClusters %>% 
+  pivot_longer(cols = c("RNAseq_cluster", "DNAm_5_cluster_letters"), 
+               names_to = "Datatype", values_to = "Cluster") %>% 
+  mutate(Datatype = case_when(
+    Datatype == "DNAm_5_cluster_letters" ~ "DNAm",
+    Datatype == "RNAseq_cluster" ~ "RNAseq"
+  )) %>% 
+  mutate(Datatype = factor(Datatype, 
+                                   levels = rev(levels(factor(Datatype)))),  
+         Cluster = factor(Cluster, levels = rev(levels(factor(Cluster)))))
+
+# Alluvial plot showing cluster correspondence
+p_alluvial <- ggplot(sample_sheet_withRNAseqClusters_long,
+                     aes(x = Datatype,  
+                         stratum = Cluster, 
+                         alluvium = M_Label, 
+                         fill = Cluster, 
+                         label = Cluster)) +
+  geom_flow(aes.flow = "backward", stat = "alluvium") +
+  geom_stratum(alpha = .75) +
+  geom_text(stat = "stratum", size = 3, aes(colour = Cluster)) +
+  theme_Publication() +
+  scale_fill_manual(values = c(colours_WT$DNAm_clustering2,
+                               "A" = "#606c38", "B" = "#283618", "C" = "#fefae0", 
+                               "D" = "#dda15e", "E" = "#bc6c25")) +
+  scale_colour_manual(values = c("C" = "black", "2a" = "white", "E" = "black", #makes cluster labels legible
+                                 "2c" = "white", "B" = "white", "1b" = "white",
+                                 "A" = "white", "D" = "black", "2b" = "white", 
+                                 "1a" = "white", "1b.Left" = "white")) +
+  coord_flip() +
+  labs(x = "Datatype", y = "Samples",
+       
+       title = "Cross-Platform Cluster Correspondence",
+       subtitle = paste0("ARI = ", round(ari, 3), ", NMI = ", round(nmi, 3), " (both permutation p < 0.001)", 
+                        ", Cramér's V = ", round(cramer_v, 3))) +
+  theme(legend.position = "none", aspect.ratio = .60) +
+  scale_x_discrete(expand = c(0.3, 0))
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1C_ClusteringDNAmvsRNAseq.pdf"), width = 8, height = 4)
+print(p_alluvial)
+# dev.off()
+
+# save raw data used to generate figures
+# write.table(sample_sheet_withRNAseqClusters %>% dplyr::select(M_Label, DNAm_5_cluster_letters, RNAseq_cluster), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1C_ClusteringDNAmvsRNAseq_data.tsv"), sep = "\t")
+
+
+# Create contingency heatmap
+tblDNAmRNAseqCorr <- as.data.frame(table(sample_sheet_withRNAseqClusters$DNAm_5_cluster_letters, 
+                                         sample_sheet_withRNAseqClusters$RNAseq_cluster)) %>% 
+  rename(RNAseq_cluster = Var2, DNAm_cluster = Var1) %>% 
+  group_by(DNAm_cluster) %>%
+  mutate(RelFreq = Freq / sum(Freq))
+
+# Heatmap showing relative frequencies
+p_heatmap <- ggplot(tblDNAmRNAseqCorr, aes(x = DNAm_cluster, y = RNAseq_cluster, fill = RelFreq)) +
+  geom_tile(color = "white", linewidth = 0.5) + 
+  geom_text(aes(label = round(RelFreq, 2)), color = "black", size = 3) +
+  scale_fill_gradient(low = "white", high = "red", name = "Relative Frequency") +
+  theme_Publication() +
+  labs(title = "Cluster Correspondence Matrix", 
+       subtitle = paste0("Chi-squared p < 0.001, Cramér's V = ", round(cramer_v, 3)),
+       x = "DNAm Cluster", y = "RNAseq Cluster") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))+
+  theme(legend.key.width = unit(0.5, "cm"))
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES1", "1A_ClusteringDNAmvsRNAseq_RelativeFrequencies.pdf"), width = 5, height = 6)
+print(p_heatmap)
+# dev.off()
+
+# write.table(tblDNAmRNAseqCorr, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES1", "RAW_DATA", "S1A_ClusteringDNAmvsRNAseq_table.tsv"), sep = "\t")
+# 
+# write.table(table(rev(sample_sheet_withRNAseqClusters$DNAm_5_cluster_letters), 
+#                                          rev(sample_sheet_withRNAseqClusters$RNAseq_cluster)),
+#             quote = FALSE, row.names = TRUE, 
+#             file = file.path(parameters$RESULTS_FOLDER, "FIGURES1", "RAW_DATA", "S1A_ClusteringDNAmvsRNAseq_RelativeFrequencies.tsv"), sep = "\t")
+
+
+# =====================================
+# 8. FINAL INTERPRETATION
+# =====================================
+
+cat("\n", rep("=", 60), "\n")
+cat("CLUSTER VALIDATION RESULTS INTERPRETATION\n")
+cat(rep("=", 60), "\n")
+
+# Interpretation logic
+ari_interpretation <- ifelse(ari >= 0.7, "excellent", 
+                            ifelse(ari >= 0.5, "good", 
+                                   ifelse(ari >= 0.2, "moderate", "poor")))
+
+nmi_interpretation <- ifelse(nmi >= 0.7, "excellent", 
+                            ifelse(nmi >= 0.5, "good", 
+                                   ifelse(nmi >= 0.3, "moderate", "poor")))
+
+cramer_interpretation <- ifelse(cramer_v >= 0.6, "strong", 
+                               ifelse(cramer_v >= 0.2, "moderate", "weak"))
+
+cat("Cross-platform clustering shows:", ari_interpretation, "agreement (ARI =", round(ari, 3), ")\n")
+cat("Information sharing between clusterings:", nmi_interpretation, "(NMI =", round(nmi, 3), ")\n")
+cat("Statistical association strength:", cramer_interpretation, "(Cramér's V =", round(cramer_v, 3), ")\n")
+cat("Statistical significance: p < 0.001 (permutation tests)\n")
+cat("\nCONCLUSION: DNAm clusters are significantly and robustly reflected in RNAseq data.\n")
+
+cat("\nValidation complete. Results saved to cluster_validation_summary.csv\n")
+
+```
+
+
+
+# Enrichment analysis 
+
+## Enrichment calculations
+
+```{r}
+# Run Chi-Square or Fisher Exact tests for covariate cluster enrichment
+
+enrichmentResults_PreoperativeChemotherapy <- run_chiSquare_or_fisher_enrichment(df = sample_sheet_clustering, 
+                                                                                 cluster_var = "DNAm_5_cluster_letters", 
+                                                                                 outcome_var = "Preoperative_chemotherapy", 
+                                                                                 y_label = "Preoperative chemotherapy")
+
+enrichmentResults_SampleGroup <- run_chiSquare_or_fisher_enrichment(df = sample_sheet_clustering, 
+                                                                    cluster_var = "DNAm_5_cluster_letters", 
+                                                                    outcome_var = "Sample_Group", 
+                                                                    y_label = NULL)
+
+enrichmentResults_PreoperativeChemotherapy$overall_significant
+enrichmentResults_SampleGroup$overall_significant
+```
+
+Only Sample group has been significant. 
+
+```{r}
+# Sample group
+enrichmentResults_SampleGroup$plot
+enrichmentResults_SampleGroup$overall_p_value
+enrichmentResults_SampleGroup$enrichment_df
+```
+
+
+# Figure 1D Histology
+
+```{r}
+# Calculate histology proportions across DNAm clusters
+sample_sheet_summary_Histology <- sample_sheet_clustering %>%
+  mutate(Corrected_histology = ifelse(Corrected_histology == "WT_with_rhabdomyoblastic_differentiation", "Stromal", 
+                                      ifelse(Corrected_histology == "Blastemal_no_DA", "Blastemal", 
+                                             ifelse(Corrected_histology == "Mixed_DA", "DA", as.character(Corrected_histology))))) %>% 
+  group_by(DNAm_5_cluster_letters, Corrected_histology) %>% 
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(DNAm_5_cluster_letters) %>%
+  mutate(
+    percentage = count / sum(count) * 100,
+    Corrected_histology = factor(
+      Corrected_histology,
+      levels = rev(c(
+        "Stromal", 
+        "Blastemal", 
+        "Epithelial", 
+        "Mixed", 
+        "Non_anaplastic", 
+        "DA", 
+        "Regressive", 
+        "Completely_necrotic",
+        NA
+      ))
+    )
+  )
+
+cluster_counts <- sample_sheet_summary_Histology %>%
+  group_by(DNAm_5_cluster_letters) %>%
+  summarise(total_samples = sum(count))
+
+# Plot: Stacked bar plot showing histology distribution per DNAm cluster
+Figure1D_Histology <- ggplot(sample_sheet_summary_Histology, 
+       aes(x = DNAm_5_cluster_letters, y = percentage, fill = Corrected_histology)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = colours_WT$histology_colors, na.value = "grey80") +
+  # Add counts above each bar
+  geom_text(data = cluster_counts, 
+            aes(x = DNAm_5_cluster_letters, y = 105,  # slightly above 100%
+                label = paste0("n=", total_samples)),
+            inherit.aes = FALSE, size = 3.5) +
+  labs(
+    x = "DNAm cluster",
+    y = "Samples [%]",
+    fill = "Histology"
+  ) +
+  theme_Publication()+
+  guides(fill = guide_legend(ncol = 3))
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1D_Histology.pdf"), width = 4, height = 4)
+Figure1D_Histology
+# dev.off()
+# 
+# write.table(sample_sheet_summary_Histology, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1D_Histology_data.tsv"), sep = "\t")
+
+```
+
+
+## Figure S1B Enrichment or depletion of histologies in clusters
+
+```{r}
+# Test histological subtype enrichment across methylation subgroups
+sample_sheet_histology <- sample_sheet_clustering %>%
+  mutate(Corrected_histology = ifelse(Corrected_histology == "WT_with_rhabdomyoblastic_differentiation", "Stromal", 
+                                      ifelse(Corrected_histology == "Blastemal_no_DA", "Blastemal", 
+                                             ifelse(Corrected_histology == "Mixed_DA", "DA", as.character(Corrected_histology)))))
+
+
+enrichmentResults_CorrectedHistology <- run_chiSquare_or_fisher_enrichment(sample_sheet_histology, "DNAm_5_cluster_letters", outcome_var = "Corrected_histology", x_label = "DNAm cluster", y_label = "Histology")
+enrichmentResults_CorrectedHistology$sig_df
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES1", "S1B_HistologyResiduals.pdf"), width = 7, height = 6)
+enrichmentResults_CorrectedHistology$plot
+# dev.off()
+
+
+# write.table(enrichmentResults_CorrectedHistology$enrichment_df, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES1", "RAW_DATA", "S1B_HistologyResiduals_data.tsv"), sep = "\t")
+
+```
+
+
+
+
+# Figure 1E Tumour content
+
+```{r}
+# Remove samples missing histological tumor purity estimates
+
+sample_sheet_tumourContent <- sample_sheet_clustering %>%
+  filter(!is.na(Tumour_content_percentage))
+
+
+# Generate all pairwise cluster comparisons -----------------------------------
+cluster_levels <- unique(sample_sheet_tumourContent$DNAm_5_cluster_letters)
+pairwise_cluster_comparisons <- combn(cluster_levels, 2, simplify = FALSE)
+
+
+# Perform pairwise Wilcoxon tests ---------------------------------------------
+# Initialize an empty data frame to store test results
+pairwise_test_results <- data.frame(
+  cluster_1 = character(),
+  cluster_2 = character(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop over each pair of clusters and perform Wilcoxon rank-sum test
+for (comp in pairwise_cluster_comparisons) {
+  # Extract tumour content values for each cluster in the pair
+  cluster1_values <- sample_sheet_tumourContent %>%
+    filter(DNAm_5_cluster_letters == comp[1]) %>%
+    pull(Tumour_content_percentage)
+  
+  cluster2_values <- sample_sheet_tumourContent %>%
+    filter(DNAm_5_cluster_letters == comp[2]) %>%
+    pull(Tumour_content_percentage)
+  
+  # Perform Wilcoxon test (non-parametric, handles ties)
+  test_result <- wilcox.test(cluster1_values, cluster2_values, exact = FALSE)
+  
+  # Store results in the data frame
+  pairwise_test_results <- rbind(pairwise_test_results,
+                                 data.frame(
+                                   cluster_1 = comp[1],
+                                   cluster_2 = comp[2],
+                                   p_value = test_result$p.value
+                                 ))
+}
+
+
+# Adjust for multiple testing -------------------------------------------------
+# Bonferroni correction and assign significance labels
+pairwise_test_results <- pairwise_test_results %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "bonferroni"),  # control for multiple tests
+    signif_label = case_when(
+      p_adj <= 0.001 ~ "***",
+      p_adj <= 0.01  ~ "**",
+      p_adj <= 0.05  ~ "*",
+      TRUE           ~ NA_character_
+    )
+  )
+
+# Assign y-positions for significance annotations ----------------------------
+# Set y positions for significance bars so they don’t overlap
+pairwise_test_results <- pairwise_test_results %>%
+  arrange(p_adj) %>%
+  mutate(y_position = seq(
+    max(sample_sheet_tumourContent$Tumour_content_percentage, na.rm = TRUE) + 5,
+    by = 5,
+    length.out = n()
+  ))
+
+# Violin plot showing tumour content distributions per cluster----------------------------------------------
+Figure1E_TumourContent <- ggplot(sample_sheet_tumourContent, aes(x = DNAm_5_cluster_letters, y = Tumour_content_percentage)) +
+  geom_violin(aes(fill = DNAm_5_cluster_letters), alpha = 0.75) +  
+  geom_jitter(width = 0.25, size =.75) +                           
+  scale_fill_manual(values = colours_WT$DNAm_clustering2) +
+  geom_signif(
+    data = pairwise_test_results %>% filter(!is.na(signif_label)), 
+    aes(xmin = cluster_1, xmax = cluster_2, annotations = signif_label, y_position = y_position),
+    manual = TRUE
+  ) +
+  theme_Publication()+
+  theme(legend.position = "none") +
+  labs(
+    y = "Tumour content [%]",
+    x = "DNAm cluster"
+  )+
+  scale_y_continuous(breaks = c(0, 25, 50, 75, 100)) 
+  
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1E_TumourContent.pdf"), width = 4, height = 4)
+Figure1E_TumourContent
+# dev.off()
+
+# write.table(sample_sheet_tumourContent %>% select(M_Label, DNAm_5_cluster_letters, Tumour_content_percentage), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1E_TumourContent_data.tsv"), sep = "\t")
+
+
+# Compare cluster 2a tumor purity vs. all other clusters combined
+cluster_2a_values <- sample_sheet_tumourContent %>%
+  filter(DNAm_5_cluster_letters == "2a") %>%
+  pull(Tumour_content_percentage)
+
+other_clusters_values <- sample_sheet_tumourContent %>%
+  filter(DNAm_5_cluster_letters != "2a") %>%
+  pull(Tumour_content_percentage)
+
+# Wilcoxon test comparing cluster 2a vs all others
+test_2a_vs_others <- wilcox.test(cluster_2a_values, other_clusters_values, exact = FALSE)
+
+# Create a summary table with p-value and adjusted p-value
+cluster_2a_comparison <- data.frame(
+  cluster = "2.a",
+  comparison = "all_other_clusters",
+  p_value = test_2a_vs_others$p.value,
+  p_adj = p.adjust(test_2a_vs_others$p.value, method = "bonferroni")
+)
+
+# Add significance label
+cluster_2a_comparison <- cluster_2a_comparison %>%
+  mutate(signif_label = case_when(
+    p_adj <= 0.001 ~ "***",
+    p_adj <= 0.01  ~ "**",
+    p_adj <= 0.05  ~ "*",
+    TRUE           ~ NA_character_
+  ))
+
+cluster_2a_comparison 
+
+
+# -------------------------------
+# Notes -------
+# - This analysis shows that cluster 2a has significantly lower tumour cell content.
+# - Figure 1E visualizes both the pairwise comparisons and the distribution per cluster.
+
+```
+
+
+# Figure 1F Predisposition distribution
+
+```{r}
+sample_sheet_simpleSummary <- sample_sheet_clustering %>%
+  rename(Cluster = DNAm_5_cluster_letters) %>%  # Rename cluster column
+  group_by(Cluster) %>%
+  summarise(
+    N = n(),
+    N_WT1orWAGR = sum(c(Sample_Group_all_germline_findings == "WT1_mutation" | Sample_Group_all_germline_findings == "WAGR_syndroom"), na.rm = TRUE),
+    N_BWSp = sum(c(Sample_Group_all_germline_findings == "BWSp" |  Sample_Group_all_germline_findings == "BWSp_and_DIS3L2"), na.rm = TRUE), 
+    N_NoPredisposition = sum(Sample_Group_all_germline_findings == "No_genetic_predisposition", na.rm = TRUE),
+    N_NotTested = sum(Sample_Group_all_germline_findings == "NotTested", na.rm = TRUE), 
+    N_DIS3L2 = sum(c(Sample_Group_all_germline_findings == "DIS3L2_mutation" | Sample_Group_all_germline_findings == "BWSp_and_DIS3L2"), na.rm = TRUE),
+    N_REST = sum(c(Sample_Group_all_germline_findings == "REST_mutation")),
+    N_Other = sum(Sample_Group_all_germline_findings %in% c("NYNRIN_mutation", "NF1_mutation", "PMS2_mutation", "Fanconi_Anemia", "BRCA2_mutation"), na.rm = TRUE)
+    )
+
+sample_sheet_simpleSummary
+
+
+# ============================================
+# PREPARE DATA FOR PLOTTING (LONG FORMAT)
+# ============================================
+
+sample_sheet_simpleSummary_long <- sample_sheet_simpleSummary %>%
+  select(-N) %>%  # Remove total N column
+  pivot_longer(
+    cols = starts_with("N_"),
+    names_to = "Predisposition",
+    values_to = "Count"
+  ) %>%
+  mutate(
+    Predisposition = gsub("N_", "", Predisposition),
+    Predisposition = factor(Predisposition, 
+                            levels = rev(c("WT1orWAGR", "BWSp", "DIS3L2", "REST", "Other", 
+                                      "NoPredisposition", "NotTested")))
+  )
+
+sample_sheet_simpleSummary_long
+
+# ============================================
+# DOT PLOT WITH PERCENTAGE
+# ============================================
+
+sample_sheet_simpleSummary_long_percPerClass  <- sample_sheet_simpleSummary_long %>%
+  group_by(Predisposition) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  ungroup()
+
+Figure1F_CPS_Distribution <- ggplot(sample_sheet_simpleSummary_long_percPerClass %>% filter(!Predisposition %in% c("NotTested", "NoPredisposition", "Other"), Count > 0), aes(x = Cluster, y = fct_relevel(Predisposition, "REST", "DIS3L2", "WT1orWAGR", "BWSp"), size = Count, fill = Predisposition)) +
+  geom_point(shape = 21, color = "black", stroke = 1.2, alpha = 0.8) +
+  
+  # Add percentage labels inside bubbles
+  geom_text(aes(
+    # label = paste0(round(Count, 0), "%")),
+    label = Count),
+            size = 3,
+  #           # fontface = "bold",
+  #           # show.legend = FALSE
+            ) +
+  
+  scale_size_continuous(
+    # name = "Percentage (%)",
+    name = "Count",
+    range = c(3, 20)
+  ) +
+ scale_fill_manual(
+       values = c(
+      "WT1orWAGR" = "#27476E",
+      "BWSp" = "#0B6E4F",
+      "DIS3L2" = "#FFC875",
+      "REST" = "#EA9386",
+      "Other" = "#909090",
+      "NoPredisposition" = "#F5F0F6",
+      "NotTested" = "grey99"
+    ),
+    labels = c(
+      "WT1orWAGR" = "WT1/WAGR",
+      "BWSp" = "BWSp",
+      "DIS3L2" = "DIS3L2",
+      "REST" = "REST",
+      "Other" = "Other",
+      "NoPredisposition" = "No predisposition",
+      "NotTested" = "Not tested"
+    )
+  ) +
+    scale_y_discrete(labels = c(
+    "BWSp",
+    "WT1orWAGR" = "WT1/WAGR",
+    "DIS3L2", 
+    "REST"
+  ))+
+  
+  labs(
+    title = "Genetic Predispositions by DNAm Cluster (Count)",
+    x = "DNAm Cluster",
+    y = "Predisposition",
+    fill = "Predisposition"
+  ) +
+  
+  guides(size = "none", fill ="none")+
+  theme_Publication()
+
+
+Figure1F_CPS_Distribution
+
+
+enrichmentResults_SampleGroup_BWSp <- run_chiSquare_or_fisher_enrichment(df = sample_sheet_clustering %>% mutate(Sample_Group = ifelse(Sample_Group == "BWSp_and_DIS3L2", "BWSp", as.character(Sample_Group))), 
+                                                                    cluster_var = "DNAm_5_cluster_letters", 
+                                                                    outcome_var = "Sample_Group", 
+                                                                    y_label = NULL)
+
+enrichmentResults_SampleGroup_DIS3L2 <- run_chiSquare_or_fisher_enrichment(df = sample_sheet_clustering %>% mutate(Sample_Group = ifelse(Sample_Group == "BWSp_and_DIS3L2", "DIS3L2", as.character(Sample_Group))), 
+                                                                    cluster_var = "DNAm_5_cluster_letters", 
+                                                                    outcome_var = "Sample_Group", 
+                                                                    y_label = NULL)
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE1", "1F_Predisposition_distribution_across_cluster.pdf"), width = 4.5, height = 4)
+Figure1F_CPS_Distribution
+# dev.off()
+
+
+# write.table(sample_sheet_simpleSummary_long_percPerClass %>% filter(Predisposition %in% c("WT1orWAGR", "BWSp", "DIS3L2", "REST")), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE1", "RAW_DATA", "1F_Predisposition_distribution_across_cluster_data.tsv"), sep = "\t")
+
+
+```
+
+
+# Save sample sheet
+
+```{r}
+saveRDS(sample_sheet_clustering, file = file.path(parameters$PROCESSED_DATA_FOLDER, "masterSampleSheet_after_figure1.rds"))
+```

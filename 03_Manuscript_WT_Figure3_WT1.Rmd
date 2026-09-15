@@ -1,0 +1,956 @@
+---
+title: "Manuscript_WT_Figure3"
+author: "Franziska Oberhammer"
+date: "2026-09-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Setup & Environment
+Loading required visualization, data manipulation, and genomic utilities alongside global configuration paths.
+
+```{r}
+# Load required libraries
+suppressPackageStartupMessages({
+  library(circlize)          
+  library(ComplexHeatmap)    
+  library(grid)              
+  library(dplyr)            
+  library(tidyverse)        
+  library(RColorBrewer)
+  library(qs)               
+  library(ggsignif)
+})
+```
+
+
+```{r}
+
+parameters <- list()
+parameters$PROJECT_FOLDER         <- "/hpc/pmc_kuiper/Wilms/METHYLATION"  
+parameters$ANALYSIS_FOLDER        <- file.path(parameters$PROJECT_FOLDER, "ANALYSIS")
+parameters$PROCESSED_DATA_FOLDER  <- file.path(parameters$ANALYSIS_FOLDER, "PROCESSED_DATA")
+parameters$CODE_FOLDER            <- file.path(parameters$PROJECT_FOLDER, "CODE")
+parameters$RESULTS                <- file.path(parameters$PROJECT_FOLDER, "RESULTS")
+
+# File paths
+parameters$CURRENT_CLUSTERING     <- file.path(parameters$ANALYSIS_FOLDER,
+                                               "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_5000mvCpGs_manuscript/innerLinkageward.D2_finalLinkageward.D2_clusterAlghc_distanceMethpearson", "clustering_tree_5clusters.qs")
+
+parameters$CURRENT_SAMPLESHEET    <- file.path(parameters$PROCESSED_DATA_FOLDER, "masterSampleSheet_after_figure2.rds")
+
+
+# Load helper functions
+source(file.path(parameters$CODE_FOLDER, "00_theme_Publication.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_colour_palettes.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_helper_functions.R"))
+
+```
+
+# Data Loading & Preprocessing
+Loading master sample sheet, consensus clustering tree, and variant metadata for WT1 and CTNNB1. Standardizing internal sample identifiers.
+
+```{r}
+
+# Load sample sheet
+sample_sheet <- readRDS(parameters$CURRENT_SAMPLESHEET) %>% 
+  mutate(
+    Cluster1avsall = ifelse(DNAm_5_cluster_letters == "1a", "Yes", "No"), 
+    Cluster1bvsall = ifelse(DNAm_5_cluster_letters == "1b", "Yes", "No"), 
+    Cluster2avsall = ifelse(DNAm_5_cluster_letters == "2a", "Yes", "No"), 
+    Cluster2bvsall = ifelse(DNAm_5_cluster_letters == "2b", "Yes", "No"), 
+    Cluster2cvsall = ifelse(DNAm_5_cluster_letters == "2c", "Yes", "No")
+  ) 
+
+dim(sample_sheet)
+
+# Load Consensus Clustering Tree
+clustering_tree <- qread(parameters$CURRENT_CLUSTERING)
+
+# Load WT1 and CTNNB1 Variant Annotations
+sample_data <- readxl::read_xlsx(
+  "/hpc/pmc_kuiper/Wilms/METHYLATION/ANALYSIS/WT1/20260716_wt1overview.xlsx" # this corresponds to supplementary table S2
+) %>% 
+  dplyr::select(
+    Internal_Patient_ID, 
+    wt1_germline_testing, wt1_germline_researchAndDiagnosticsCombined, wt1_germline_Diagnostics,  wt1_germline_oncoplot_label,   
+    wt1_somatic_1, wt1_somatic_Diagnostics_1, wt1_somatic_1_oncoplot_label,
+    wt1_somatic_2, wt1_somatic_Diagnostics_2, wt1_somatic_2_oncoplot_label,
+    wt1_loh, 
+    ctnnb1_somatic_1, ctnnb1_somatic_2, ctnnb1_somatic_1_oncoplot_label, ctnnb1_somatic_2_oncoplot_label,
+    ctnnb1_Diagnostics_somatic_1, ctnnb1_Diagnostics_somatic_2, DataType,
+    wt1_somatic_1_Classification, wt1_somatic_2_Classification
+  ) %>%
+  mutate(sample_id = Internal_Patient_ID) %>% 
+  mutate()
+
+
+# Map internal IDs to M-Labels and filter for train samples
+sample_data$M_Label <- sample_sheet$M_Label[match(x = sample_data$Internal_Patient_ID, sample_sheet$Internal_Patient_ID)]
+
+sample_data_filtered <- sample_data %>%   
+  filter(M_Label %in% clustering_tree$labels)
+
+# Extract unique variants in the dataset
+values_inFile <- unique(c(
+  sample_data_filtered$wt1_germline_testing, 
+  sample_data_filtered$wt1_germline_oncoplot_label,
+  sample_data_filtered$wt1_somatic_1, 
+  sample_data_filtered$wt1_somatic_1_oncoplot_label,
+  sample_data_filtered$wt1_somatic_2, 
+  sample_data_filtered$wt1_somatic_2_oncoplot_label,
+  sample_data_filtered$ctnnb1_somatic_1, 
+  sample_data_filtered$ctnnb1_somatic_1_oncoplot_label,
+  sample_data_filtered$ctnnb1_somatic_2, 
+  sample_data_filtered$ctnnb1_somatic_2_oncoplot_label,
+  sample_data_filtered$wt1_loh
+))
+
+values_inFileOncoplotLabels <- unique(c(
+  sample_data_filtered$wt1_germline_oncoplot_label,
+  sample_data_filtered$wt1_somatic_1_oncoplot_label,
+  sample_data_filtered$wt1_somatic_2_oncoplot_label,
+  sample_data_filtered$ctnnb1_somatic_1_oncoplot_label,
+  sample_data_filtered$ctnnb1_somatic_2_oncoplot_label,
+  sample_data_filtered$wt1_loh
+))
+
+```
+
+# Variant Color Schemes & Functional Helpers
+
+```{r}
+# Read Variant Class Color Mapping
+variant_info <- read.csv2(
+  sep = "\t", 
+  file = file.path(parameters$CODE_FOLDER, "00_WT_variant_info.tsv")) %>% 
+  filter(NewOld == "New" | group %in% c("Copy number/LOH", "Datatype"))
+
+
+# Function: Fetch Color Code per Variant Type
+get_variant_color <- function(variant) {
+  if (is.na(variant) || variant == "") {
+    return(variant_info$color[variant_info$variant == "None_WT1"])
+  }
+  
+  color_match <- variant_info$color[variant_info$variant == variant]
+  if (length(color_match) > 0) return(color_match)
+  
+  return(variant_info$color[variant_info$variant == "None_WT1"])
+}
+
+# Verify that all variants in the data are defined in the color scheme
+values_inFile[!values_inFile %in% variant_info$variant]
+values_inFileOncoplotLabels[!values_inFileOncoplotLabels %in% variant_info$variant]
+
+# Set color vector for heatmap
+variant_colors <- setNames(variant_info$color, variant_info$variant)
+
+
+
+
+
+# Function: Flag Non-Standard Biomaterial Sources
+is_other_biomaterial <- function(variant) {
+  if (is.na(variant) || variant == "") return(FALSE)
+  
+  flag <- variant_info$OtherBiomaterial[variant_info$variant == variant]
+  if (length(flag) == 0) return(FALSE)
+  
+  return(flag %in% c("•", TRUE, "TRUE", 1))
+}
+
+# Function: Identify Pathogenic Hits
+is_hit <- function(value) {
+  if (is.na(value) || value == "") return(FALSE)
+  hit_status <- variant_info$is_hit[variant_info$variant == value]
+  if (length(hit_status) > 0) return(hit_status)
+  return(FALSE)
+}
+
+```
+
+
+# Preprocess variant data
+
+```{r}
+# Standardize Missing Data and Low Quality Flags
+# Replace placeholders / low-quality flags with "None"
+
+to_replace <- c("NoSNVsOnlyWXSThusNoSVsChecked", "LOH_alreadyInSV", "NoneBadQuality")
+to_replace2 <- c("WXSnotAnalysed", "notAnalysed")
+
+ctnnb1_cols <- grepl("CTNNB1", names(sample_data_filtered), ignore.case = TRUE)
+wt1_cols    <- grepl("WT1", names(sample_data_filtered), ignore.case = TRUE) & !grepl("loh", names(sample_data_filtered), ignore.case = TRUE)
+other_cols  <- !grepl("WT1|CTNNB1", names(sample_data_filtered), ignore.case = TRUE)
+wt1loh_cols <- grepl("wt1_loh", names(sample_data_filtered), ignore.case = TRUE)
+
+
+sample_data_filtered[ctnnb1_cols] <- lapply(sample_data_filtered[ctnnb1_cols], function(col) ifelse(col %in% to_replace, "None_CTNNB1", col))
+sample_data_filtered[ctnnb1_cols] <- lapply(sample_data_filtered[ctnnb1_cols], function(col) ifelse(col %in% to_replace2, "noData", col))
+
+sample_data_filtered[wt1loh_cols] <- lapply(sample_data_filtered[wt1loh_cols], function(col) ifelse(col %in% to_replace, "None", col))
+sample_data_filtered[wt1loh_cols] <- lapply(sample_data_filtered[wt1loh_cols], function(col) ifelse(col %in% to_replace2, "noData", col))
+
+sample_data_filtered[wt1_cols]    <- lapply(sample_data_filtered[wt1_cols], function(col) ifelse(col %in% to_replace, "None_WT1", col))
+sample_data_filtered[wt1_cols]    <- lapply(sample_data_filtered[wt1_cols], function(col) ifelse(col %in% to_replace2, "noData", col))
+
+sample_data_filtered[other_cols]  <- lapply(sample_data_filtered[other_cols], function(col) ifelse(col %in% to_replace, "None", col))
+
+# Check whether all values are in file
+values_inFile_afterPrep <- unique(c(sample_data_filtered$wt1_germline_oncoplot_label, 
+                                    sample_data_filtered$wt1_somatic_1_oncoplot_label, 
+                                    sample_data_filtered$wt1_somatic_2_oncoplot_label, 
+                                    sample_data_filtered$ctnnb1_somatic_1_oncoplot_label, 
+                                    sample_data_filtered$ctnnb1_somatic_2_oncoplot_label, 
+                                    sample_data_filtered$wt1_loh, 
+                                    sample_data_filtered$DataType)) 
+values_inFile_afterPrep
+
+
+values_inFile_afterPrep[!values_inFile_afterPrep %in% names(variant_colors)]
+```
+
+
+# Define 'two hits' logic for WT1
+
+```{r}
+#--------------------------------------------#
+# Define 'two hits' logic for WT1
+# WT1 considered two-hit if:
+# 1) Germline + somatic
+# 2) Germline + LOH
+# 3) Somatic + LOH
+# 4) Two somatic variants
+#--------------------------------------------#
+create_wt1_two_hits_row <- function(data1) {
+  two_hits <- sapply(1:nrow(data1), function(i) {
+    germline_hit <- is_hit(data1$wt1_germline_oncoplot_label[i])
+    somatic_hit_1 <- is_hit(data1$wt1_somatic_1_oncoplot_label[i])
+    somatic_hit_2 <- is_hit(data1$wt1_somatic_2_oncoplot_label[i])
+    loh_hit <- is_hit(data1$wt1_loh[i])
+    
+    has_two_hits <- (
+      (germline_hit && (somatic_hit_1 || somatic_hit_2)) ||
+        (germline_hit && loh_hit) ||
+        ((somatic_hit_1 || somatic_hit_2) && loh_hit) ||
+        (somatic_hit_1 && somatic_hit_2)
+    )
+    
+    return(ifelse(has_two_hits, expression(` [*]`), ""))
+  })
+  
+  mat <- matrix(two_hits, nrow = 1)
+  colnames(mat) <- data1$M_Label
+  rownames(mat) <- "WT1 Two Hits"
+  return(mat)
+}
+```
+
+# Oncoplot 
+
+```{r}
+# -----------------------------
+# Oncoplot preparation and drawing
+# -----------------------------
+
+# ---- Values to include ----
+values_inFile_afterPrep <- unique(c(
+  sample_data_filtered$wt1_germline_oncoplot_label, 
+  sample_data_filtered$wt1_somatic_1_oncoplot_label, 
+  sample_data_filtered$wt1_somatic_2_oncoplot_label, 
+  sample_data_filtered$ctnnb1_somatic_1_oncoplot_label, 
+  sample_data_filtered$ctnnb1_somatic_2_oncoplot_label, 
+  sample_data_filtered$wt1_loh, 
+  sample_data_filtered$DataType
+))
+
+# ---- Two hits row (WT1 biallelic) ----
+wt1_two_hits_mat <- matrix(sapply(1:nrow(sample_data_filtered), function(i) {
+  hits <- c(
+    is_hit(sample_data_filtered$wt1_germline_oncoplot_label[i]),
+    is_hit(sample_data_filtered$wt1_somatic_1_oncoplot_label[i]),
+    is_hit(sample_data_filtered$wt1_somatic_2_oncoplot_label[i]),
+    is_hit(sample_data_filtered$wt1_loh[i])
+  )
+  ifelse(sum(hits) >= 2, "TRUE", "FALSE")
+}), nrow = 1)
+colnames(wt1_two_hits_mat) <- sample_data_filtered$M_Label
+rownames(wt1_two_hits_mat) <- "WT1 Two Hits"
+
+# ---- Helper: Make heatmap with dot overlay ----
+make_ht <- function(mat, name, show_names = FALSE, cell_fun = NULL) {
+  Heatmap(
+    mat,
+    name = name,
+    cluster_columns = as.dendrogram(clustering_tree),
+    column_split = 5,
+    show_heatmap_legend = FALSE,
+    col = variant_colors,
+    show_column_names = show_names,
+    show_row_names = TRUE,
+    row_names_gp = gpar(fontsize = 10),
+    column_names_gp = gpar(fontsize = 8),
+    height = unit(0.8, "cm"),
+    cell_fun = cell_fun
+  )
+}
+
+# ---- Custom cell function for somatic triangles + dots ----
+draw_somatic_cell <- function(j, i, x, y, width, height, fill) {
+  somatic1 <- sample_data_filtered$wt1_somatic_1_oncoplot_label[j]
+  somatic2 <- sample_data_filtered$wt1_somatic_2_oncoplot_label[j]
+  
+  # Neutral background
+  if(somatic1 == "noData"){
+    grid.rect(x, y, width, height, gp = gpar(fill = "#ECECEC", col = NA))
+  } else {
+    grid.rect(x, y, width, height, gp = gpar(fill = "#D6D6D6", col = NA))
+  }
+  
+  # Bottom-left triangle: somatic1
+  if(!is.na(somatic1) && somatic1 != "None_WT1") {
+    grid.polygon(
+      x = c(x - width/2, x + width/2, x - width/2),
+      y = c(y - height/2, y - height/2, y + height/2),
+      gp = gpar(fill = get_variant_color(somatic1), col = NA)
+    )
+  }
+  
+  # Top-right triangle: somatic2
+  if(!is.na(somatic2) && somatic2 != "None_WT1") {
+    grid.polygon(
+      x = c(x - width/2, x + width/2, x + width/2),
+      y = c(y + height/2, y + height/2, y - height/2),
+      gp = gpar(fill = get_variant_color(somatic2), col = NA)
+    )
+  }
+  
+  # Add white dot if either variant is OtherBiomaterial
+  if(is_other_biomaterial(somatic1) || is_other_biomaterial(somatic2)) {
+    grid.points(x, y, pch = 16, size = unit(1.8, "mm"), gp = gpar(col = "white"))
+  }
+}
+
+# ---- Cell function for single variants (Germline, LOH, CTNNB1) ----
+draw_variant_cell <- function(j, i, x, y, width, height, fill, variant_column) {
+  variant <- sample_data_filtered[[variant_column]][j]
+  fill_color <- get_variant_color(variant)
+  
+  # Draw cell
+  grid.rect(x, y, width, height, gp = gpar(fill = fill_color, col = NA))
+  
+  # Overlay symbol logic
+  if(variant == "None_WT1_Diagnostics_butNotCheckedResearch") {
+    grid.text("-", x = x, y = y, gp = gpar(col = "grey70", fontsize = 12, fontface = "bold"))
+  } else if(is_other_biomaterial(variant)) {
+    grid.points(x, y, pch = 16, size = unit(1.8, "mm"), gp = gpar(col = "white"))
+  }
+}
+
+# ---- Create heatmap matrices ----
+create_variant_matrix <- function(data, colname) {
+  mat <- matrix(data[[colname]], nrow = 1)
+  colnames(mat) <- data$M_Label
+  return(mat)
+}
+
+wt1_germline_mat   <- create_variant_matrix(sample_data_filtered, "wt1_germline_oncoplot_label")
+wt1_somatic_mat    <- matrix(rep("Somatic", nrow(sample_data_filtered)), nrow = 1)
+colnames(wt1_somatic_mat) <- sample_data_filtered$M_Label
+wt1_loh_mat        <- create_variant_matrix(sample_data_filtered, "wt1_loh")
+ctnnb1_somatic_mat <- create_variant_matrix(sample_data_filtered, "ctnnb1_somatic_1_oncoplot_label")
+datatype_mat       <- create_variant_matrix(sample_data_filtered, "DataType")
+
+rownames(wt1_germline_mat) <- "WT1 Germline"
+rownames(wt1_somatic_mat) <- "WT1 Somatic"
+rownames(wt1_loh_mat) <- "LOH/CN-LOH"
+rownames(ctnnb1_somatic_mat) <- "CTNNB1 Somatic"
+rownames(datatype_mat) <- "Somatic Datatype"
+
+
+
+# ---- Create heatmaps ----
+ht_wt1_two_hits <- Heatmap(
+  wt1_two_hits_mat,
+  name = "WT1 Two Hits",
+  cluster_columns = as.dendrogram(clustering_tree),
+  column_split = 5,
+  show_heatmap_legend = FALSE,
+  col = c("TRUE" = "white", "FALSE" = "white"), # all background white
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  show_column_names = FALSE,
+  height = unit(0.8, "cm"),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    # Draw white background rectangle
+    grid.rect(x, y, width, height, gp = gpar(fill = "white", col = NA))
+    
+    # Draw red * in the middle if present
+    if(wt1_two_hits_mat[i, j] == "TRUE") {
+      grid.text("*", x = x, y = y, gp = gpar(col = "red", fontsize = 14, fontface = "bold"))
+    }
+  }
+)
+
+ht_wt1_germline <- make_ht(
+  wt1_germline_mat, "WT1_Germline", show_names = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    draw_variant_cell(j, i, x, y, width, height, fill, "wt1_germline_oncoplot_label")
+  }
+)
+
+ht_wt1_somatic <- make_ht(
+  wt1_somatic_mat, 
+  "WT1_Somatic", 
+  cell_fun = draw_somatic_cell
+)
+
+ht_wt1_loh <- make_ht(
+  wt1_loh_mat, "WT1_LOH", cell_fun = function(j,i,x,y,w,h,f){
+    draw_variant_cell(j,i,x,y,w,h,f, "wt1_loh")
+  }
+)
+
+ht_ctnnb1_somatic <- make_ht(
+  ctnnb1_somatic_mat, "CTNNB1_Somatic", cell_fun = function(j,i,x,y,w,h,f){
+    draw_variant_cell(j,i,x,y,w,h,f, "ctnnb1_somatic_1_oncoplot_label")
+  }
+)
+
+ht_datatype <- make_ht(datatype_mat, "Datatype", show_names = TRUE)
+
+# ---- Create legend with "Other biomaterial" dot ----
+create_legend <- function(values_inFile) {
+  
+  legend_order <- c(
+    "Truncating_or_Deletion","Truncating/Deletion_VUS","Complex_SV_or_SV","SV_VUS","Missense","Missense_VUS","Splice","None_WT1",
+    "Exon3_Missense_Stabilising","Exon3_S45del_Stabilising","PartsExon3Deleted","None_CTNNB1",
+    "CN_LOH","LOH","OtherBiomaterialCN_LOH","Gain","None",
+    "WGS","WES",
+    "NotTested","notAnalysed","WXSnotAnalysed","NoSNVsOnlyWXSThusNoSVsChecked",
+    "BadQuality","NoneBadQuality","noData","sampleSwap","LOH_alreadyInSV"
+  )
+  
+  group_order <- c("WT1","CTNNB1","Copy number/LOH","Datatype","Technical / missing / flags")
+  
+  present_variants <- variant_info %>%
+    filter(variant %in% values_inFile) %>% 
+    filter(!grepl("OtherBiomaterial", variant))
+  
+  legend_list <- list()
+  
+  for(group_name in group_order) {
+    if(!group_name %in% present_variants$group) next
+    group_data <- present_variants %>%
+      filter(group == group_name) %>%
+      mutate(variant = factor(variant, levels = legend_order)) %>%
+      arrange(variant)
+    
+    legend_list[[group_name]] <- Legend(
+      title = group_name,
+      at = group_data$variant,
+      labels = group_data$variant_label,
+      graphics = lapply(seq_len(nrow(group_data)), function(i){
+        fill_col <- group_data$color[i]
+        has_dot <- is_other_biomaterial(group_data$variant[i])
+        function(x,y,w,h){
+          grid.rect(x,y,w,h,gp=gpar(fill=fill_col,col=NA))
+          if(has_dot) grid.points(x,y,pch=16,size=unit(1.8,"mm"),gp=gpar(col="white"))
+        }
+      }),
+      title_gp = gpar(fontsize=12,fontface="bold"),
+      labels_gp = gpar(fontsize=10)
+    )
+  }
+  
+  # Additional information sublegend
+  legend_list[["Additional information"]] <- Legend(
+    title = "Additional information",
+    labels = "Other biomaterial",
+    type = "points",
+    pch = 16,
+    legend_gp = gpar(col = "white"),
+    title_gp = gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = gpar(fontsize = 10)
+  )
+  
+  packLegend(legends=legend_list, direction="horizontal", column_gap=unit(1.5,"cm"))
+}
+
+# ---- Combine & Draw ----
+combined_heatmap <- ht_wt1_two_hits %v% ht_wt1_germline %v% ht_wt1_somatic %v% ht_wt1_loh %v% ht_ctnnb1_somatic %v% ht_datatype
+
+draw(
+  combined_heatmap,
+  heatmap_legend_list = create_legend(values_inFile_afterPrep),
+  annotation_legend_side = "bottom",
+  column_title = "WT1 and CTNNB1 Variants",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold")
+)
+
+# Save PDF
+# pdf(file = file.path(parameters$RESULTS, "FIGURE3", "WT1_CTNNB1_oncoplot.pdf"), width = 21, height = 6)
+draw(
+  combined_heatmap,
+  heatmap_legend_list = create_legend(values_inFile_afterPrep),
+  annotation_legend_side = "bottom",
+  column_title = "WT1 and CTNNB1 Variants",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold")
+)
+# dev.off()
+
+
+# write.table(sample_data_filtered %>% dplyr::select(M_Label, wt1_germline_oncoplot_label, wt1_somatic_1_oncoplot_label, wt1_somatic_2_oncoplot_label, wt1_loh, ctnnb1_somatic_1_oncoplot_label, ctnnb1_somatic_2_oncoplot_label, DataType), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS, "FIGURE3", "RAW_DATA", "3A_WT1_Oncoplot.tsv"), sep = "\t")
+
+```
+
+
+
+
+
+# WT1 and CTNNB1 Frequencies Across DNAm Clusters
+
+```{r}
+# record unique variants for sanity check
+uniqueVariants <- c(sample_data_filtered$wt1_germline_oncoplot_label, sample_data_filtered$wt1_somatic_1_oncoplot_label, sample_data_filtered$wt1_somatic_2_oncoplot_label, sample_data_filtered$ctnnb1_somatic_1_oncoplot_label, sample_data_filtered$ctnnb1_somatic_2_oncoplot_label ) %>% unique()
+
+# get variants of WT1 and CTNNB1
+variantsWT1 <- c("CN_LOH", "LOH", "Gain", "Truncating_or_Deletion", "Complex_SV_or_SV", "Splice", "Missense")
+variantsCTNNB1 <- c("Exon3_Missense_Stabilising", "Exon3_S45del_Stabilising", "PartsExon3Deleted")
+noVariants <- c("None_CTNNB1", "None_WT1", "None_WT1_Diagnostics_butNotCheckedResearch", "Missense_VUS") 
+notTestedEtc <- c("NotTested", "noData") 
+variantsCTNNB1OtherBiomaterial <- c("Exon3_Missense_Stabilising_OtherBiomaterial", "Exon3_S45del_Stabilising_OtherBiomaterial") # will not be needed here, but add it for sanity check to see whether all possible variants we have in the sheet are in the list!
+
+coveredVariants <- c(variantsWT1, variantsCTNNB1, noVariants, notTestedEtc, variantsCTNNB1OtherBiomaterial)
+
+stopifnot(all(uniqueVariants %in% coveredVariants))
+
+
+# Classify samples into combined WT1 / CTNNB1 mutation categories
+boxplot_data <- sample_data_filtered %>%
+  mutate(WT1_CTNNB1 = case_when(
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_somatic_1_oncoplot_label %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1biallelicAndCTNNB1",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_somatic_2_oncoplot_label %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1biallelicAndCTNNB1",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_loh %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1biallelicAndCTNNB1",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1 &  wt1_somatic_2_oncoplot_label %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1biallelicAndCTNNB1",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1 &  wt1_loh %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1biallelicAndCTNNB1",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1monoallelicAndCTNNB1",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1 & ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "WT1monoallelicAndCTNNB1",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_somatic_1_oncoplot_label %in% variantsWT1 ~ "WT1biallelic",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_somatic_2_oncoplot_label %in% variantsWT1 ~ "WT1biallelic",
+    wt1_germline_oncoplot_label %in% variantsWT1 &  wt1_loh %in% variantsWT1 ~ "WT1biallelic",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1 &  wt1_somatic_2_oncoplot_label %in% variantsWT1  ~ "WT1biallelic",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1 &  wt1_loh %in% variantsWT1 ~ "WT1biallelic",
+    wt1_germline_oncoplot_label %in% variantsWT1 & wt1_somatic_1 == "noData" ~ "WT1monoallelicGermlineAndNoSomaticData",
+    wt1_germline_oncoplot_label %in% variantsWT1 ~ "WT1monoallelic",
+    wt1_somatic_1_oncoplot_label %in% variantsWT1  ~ "WT1monoallelic",
+    ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "CTNNB1",
+    wt1_somatic_1_oncoplot_label == "noData" ~ "noData",
+    TRUE ~ "noVariants"
+  )) %>% dplyr::select(Internal_Patient_ID, WT1_CTNNB1, wt1_germline_oncoplot_label, wt1_somatic_1_oncoplot_label, wt1_somatic_2_oncoplot_label, wt1_loh, ctnnb1_somatic_1_oncoplot_label, ctnnb1_somatic_2_oncoplot_label)
+
+
+sample_sheet_wWTinfo <- left_join( sample_sheet %>% filter(!is.na(DNAm_5_cluster_letters)), boxplot_data) 
+
+
+sample_sheet_boxplot <- sample_sheet_wWTinfo %>%  
+  filter(WT1_CTNNB1!= "noData") %>% 
+  mutate(Cluster1bvsOther = factor(case_when(
+    DNAm_5_cluster_letters == "1b" ~ "1b",
+    TRUE ~ "Other"), levels = c("1b", "Other"))
+  )
+
+
+
+# Summarize Counts & Relative Percentages
+plot_data <- sample_sheet_boxplot %>%
+  group_by(Cluster1bvsOther, WT1_CTNNB1) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Cluster1bvsOther) %>%
+  mutate(freq = n / sum(n)) %>%   # relative frequency within each group
+  mutate(perc = freq*100)
+
+# Control stacking order of WT1_CTNNB1_status
+plot_data$WT1_CTNNB1 <- factor(plot_data$WT1_CTNNB1,
+                               levels = rev(c(
+                                 "WT1biallelicAndCTNNB1",
+                                 "WT1biallelic",
+                                 "WT1monoallelicAndCTNNB1",
+                                 "WT1monoallelicGermlineAndNoSomaticData",
+                                 "WT1monoallelic",
+                                 "CTNNB1",
+                                 "noVariants",
+                                 "noData"
+                               )))
+
+
+# Define color mapping
+status_colors <- c(
+  "WT1biallelicAndCTNNB1"       = "#3d348b",  # dark red
+  "WT1biallelic"                = "#7678ed",  # red
+  "WT1monoallelicAndCTNNB1"      = "#f35b04",  # dark orange
+  # "WT1monoallelicGermlineAndNoSomaticData"= "black",
+  "WT1monoallelicGermlineAndNoSomaticData"= "#F27100",
+  "WT1monoallelic"               = "#f18701",  # orange
+  "CTNNB1"                      = "#f7b801",  # blue
+  "noVariants" = "grey90"# grey
+)
+
+
+# number of samples per group
+sample_sheet_boxplot %>%
+  group_by(Cluster1bvsOther) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Plot Relative Frequency Stacked Bar Chart
+WT1_CTNNB1_plot <- ggplot(plot_data, aes(x = Cluster1bvsOther, y = freq, fill = WT1_CTNNB1)) +
+  geom_bar(stat = "identity", position = "fill") +  # position="fill" makes it 100%
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = status_colors, labels = rev(c("WT1biallelicAndCTNNB1",
+                                                           "WT1biallelic",
+                                                           "WT1monoallelicAndCTNNB1",
+                                                           "WT1monoallelicGermlineAndNoSomaticData",
+                                                           "WT1monoallelic",
+                                                           "CTNNB1",
+                                                           "noVariants"
+  ))) +
+  scale_fill_manual(values = status_colors) +
+  labs(
+    x = "Cluster",
+    y = "Relative frequency (%)",
+    fill = "WT1 / CTNNB1 status",
+    title = "Relative frequencies of WT1 / CTNNB1 status per Cluster \n(excluding VUS, considering LOH only for biallelic hit, not including other biomaterials)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )+
+  theme_Publication(base_size = 14)
+
+WT1_CTNNB1_plot
+
+
+# pdf(file = file.path(parameters$RESULTS, "FIGURE3", "WT1_CTNNB1_relativeFrequencies_1bvsOther.pdf"), width = 8, height = 6)
+WT1_CTNNB1_plot
+# dev.off()
+
+
+# write.table(plot_data, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS, "FIGURE3", "RAW_DATA", "3C_WT1_FrequenciesPerDNAmCluster.tsv"), sep = "\t")
+```
+
+
+```{r}
+# Test overall enrichment of WT1 variants in cluster 1b vs others
+sample_sheet_boxplot_stats <- sample_sheet_boxplot %>% 
+  filter(WT1_CTNNB1 != "noData") %>% 
+  mutate(variantsWT1 = ifelse(WT1_CTNNB1 %in% c("WT1biallelicAndCTNNB1", 
+                                                "WT1biallelic", 
+                                                "WT1monoallelicGermlineAndNoSomaticData",
+                                                "WT1monoallelic", 
+                                                "WT1monoallelicAndCTNNB1"), "Variant", "NoVariant"))
+
+
+# proportion of samples with WT1 variant in 1b and in other groups
+tab <- table(sample_sheet_boxplot_stats$variantsWT1, sample_sheet_boxplot_stats$Cluster1bvsall)
+prop.table(tab, margin =2) # 1b: 75.86% yes, Other cluster 6.17% yes
+
+# test whether difference is significant
+chisq.test(table(sample_sheet_boxplot_stats$variantsWT1, sample_sheet_boxplot_stats$Cluster1bvsall))
+```
+
+
+
+
+# Statistical Associations for Manuscript Text
+
+Statistical verification of germline/somatic WT1 and CTNNB1 mutation enrichment in cluster 1b.
+
+```{r}
+# -------------------- Prepare WT1 two-hit data --------------------
+wt1_two_hits_df <- data.frame(
+  M_Label = colnames(wt1_two_hits_mat),
+  TwoHitsWT1 = as.vector(wt1_two_hits_mat)
+)
+
+# -------------------- Simplify mutation annotations --------------------
+sample_sheet_simplified <- sample_sheet_wWTinfo %>%
+  mutate(
+    # WT1 germline status
+    WT1_simplified_germline = case_when(
+      wt1_germline_oncoplot_label %in% variantsWT1 ~ "Yes",
+      wt1_germline_oncoplot_label %in% noVariants ~ "No",
+      wt1_germline_oncoplot_label %in% notTestedEtc ~ "NoDataOrNotTested",
+      TRUE ~ NA_character_
+    ),
+    
+    # WT1 somatic status
+    WT1_simplified_somatic = case_when(
+      wt1_somatic_1_oncoplot_label %in% variantsWT1 ~ "Yes",
+      wt1_somatic_1_oncoplot_label %in% noVariants ~ "No",
+      wt1_somatic_1_oncoplot_label %in% notTestedEtc ~ "NoDataOrNotTested",
+      TRUE ~ NA_character_
+    ),
+    
+    # Combined WT1 status
+    WT1_simplified_combined = case_when(
+      WT1_simplified_germline == "Yes" ~ "Germline",
+      WT1_simplified_somatic == "Yes" ~ "Somatic",
+      WT1_simplified_somatic == "NoDataOrNotTested" ~ "NoDataOrNotTested",
+      WT1_simplified_germline == "No" & WT1_simplified_somatic == "No" ~ "NoVariant",
+      TRUE ~ NA_character_
+    ),
+    
+    # CTNNB1 somatic status
+    CTNNB1_simplified_somatic = case_when(
+      ctnnb1_somatic_1_oncoplot_label %in% variantsCTNNB1 ~ "Yes",
+      ctnnb1_somatic_1_oncoplot_label %in% c(noVariants, variantsCTNNB1OtherBiomaterial) ~ "No",
+      ctnnb1_somatic_1_oncoplot_label %in% notTestedEtc ~ "NoDataOrNotTested",
+      TRUE ~ NA_character_
+    ),
+    
+    # Combined CTNNB1 status
+    CTNNB1_simplified_combined = case_when(
+      CTNNB1_simplified_somatic == "Yes" ~ "Somatic",
+      CTNNB1_simplified_somatic == "NoDataOrNotTested" ~ "NoDataOrNotTested",
+      CTNNB1_simplified_somatic == "No" ~ "NoVariant",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  left_join(wt1_two_hits_df, by = "M_Label")
+
+# -------------------- WT1 germline --------------------
+
+# Number of patients with germline WT1 pathogenic variants
+table(sample_sheet_simplified$WT1_simplified_germline)
+
+# Distribution across DNAm clusters
+table(sample_sheet_simplified$WT1_simplified_germline,
+      sample_sheet_simplified$DNAm_5_cluster_letters)
+
+# Perform a chi-square test to assess association between WT1 germline status and DNAm cluster distribution
+# Filter to include only samples with available germline WT1 data
+# (i.e., exclude samples that were not tested or have missing data)
+set.seed(1)
+sample_sheet_simplified %>% 
+  filter(WT1_simplified_germline != "NoDataOrNotTested") %>% 
+  with(table(WT1_simplified_germline, DNAm_5_cluster_letters)) %>% 
+  chisq.test()
+
+# Fisher’s exact test was additionally performed:
+set.seed(1)
+sample_sheet_simplified %>% 
+  filter(WT1_simplified_germline != "NoDataOrNotTested") %>% 
+  with(table(WT1_simplified_germline, DNAm_5_cluster_letters)) %>% 
+  fisher.test()
+
+
+# -------------------- WT1 somatic --------------------
+
+table(sample_sheet_simplified$WT1_simplified_somatic)
+
+table(sample_sheet_simplified$WT1_simplified_combined)
+
+# Distribution across DNAm clusters
+table(sample_sheet_simplified$WT1_simplified_combined,
+      sample_sheet_simplified$DNAm_5_cluster_letters)
+
+# -------------------- Biallelic WT1 --------------------
+table(sample_sheet_simplified$WT1_simplified_combined,
+      sample_sheet_simplified$TwoHitsWT1,
+      sample_sheet_simplified$DNAm_5_cluster_letters)
+
+# -------------------- WT1 and CTNNB1 co-occurrence --------------------
+
+# Within cluster 1b
+sample_sheet_simplified %>%
+  filter(DNAm_5_cluster_letters == "1b") %>%
+  with(table(WT1_simplified_combined, CTNNB1_simplified_combined))
+
+# Outside cluster 1b
+sample_sheet_simplified %>%
+  with(table(WT1_simplified_combined,
+             CTNNB1_simplified_combined,
+             DNAm_5_cluster_letters))
+
+# -------------------- CTNNB1 --------------------
+
+sample_sheet_simplified %>%
+  with(table(CTNNB1_simplified_combined,
+             DNAm_5_cluster_letters))
+
+# Perform Fisher’s Exact Test to assess association between CTNNB1 status and cluster assignment
+# Filter to include only samples with available CTNNB1 data
+# (i.e., exclude samples that were not tested or have missing data)
+sample_sheet_simplified %>%
+  filter(CTNNB1_simplified_combined != "NoDataOrNotTested") %>% 
+  with(table(CTNNB1_simplified_combined,
+             Cluster1bvsall)) %>% 
+  fisher.test()
+
+# -------------------- Additional summaries --------------------
+
+# Patients not tested for germline WT1
+sample_sheet_boxplot %>%
+  filter(wt1_germline_oncoplot_label == "NotTested")
+
+```
+
+
+
+# Diagnostic vs. Research Variant Calling Comparison
+
+```{r}
+
+sample_sheet_simplified_diagnosticsInfo <- left_join(sample_sheet_simplified, sample_data_filtered %>%
+                                                       dplyr::select(Internal_Patient_ID, wt1_germline_Diagnostics,
+                                                                     wt1_somatic_Diagnostics_1, wt1_somatic_Diagnostics_2, 
+                                                                     ctnnb1_Diagnostics_somatic_1, ctnnb1_Diagnostics_somatic_2) )
+
+# =====================================
+# RESEARCH vs DIAGNOSTIC WT1 DETECTION
+# =====================================
+
+# Data preparation: filter samples with diagnostic information
+samples_with_diagnostics_germline <- sample_sheet_simplified_diagnosticsInfo %>% 
+  filter(wt1_germline_Diagnostics != "NA")
+samples_with_diagnostics_somatic <- sample_sheet_simplified_diagnosticsInfo %>% 
+  filter(wt1_somatic_Diagnostics_1 != "NA")
+
+
+
+# =====================================
+# GERMLINE WT1: RESEARCH vs DIAGNOSTICS COMPARISON
+# =====================================
+
+cat("GERMLINE WT1 ANALYSIS:\n")
+cat("======================\n")
+
+cat("Samples with germline diagnostic WT1 information:", nrow(samples_with_diagnostics_germline), "\n\n")
+
+# Comparison table: research classification vs diagnostic detection
+germline_comparison <- table(samples_with_diagnostics_germline$WT1_simplified_germline, 
+                             samples_with_diagnostics_germline$wt1_germline_Diagnostics)
+
+cat("Research vs Diagnostic detection of germline WT1:\n")
+print(germline_comparison)
+
+
+
+# =====================================
+# SOMATIC WT1: RESEARCH vs DIAGNOSTICS COMPARISON  
+# =====================================
+
+cat("SOMATIC WT1 ANALYSIS:\n")
+cat("=====================\n")
+
+samples_with_diagnostics_somatic[samples_with_diagnostics_somatic$wt1_somatic_Diagnostics_1 == 'Found' & samples_with_diagnostics_somatic$WT1_simplified_somatic == "No", "wt1_somatic_Diagnostics_1"] <- "NoWT1variant"
+
+cat("Somatic samples checked in diagnostics:", nrow(samples_with_diagnostics_somatic), "\n")
+
+# Comparison table: research classification vs diagnostic detection
+somatic_comparison <- table(samples_with_diagnostics_somatic$WT1_simplified_somatic, 
+                            samples_with_diagnostics_somatic$wt1_somatic_Diagnostics_1 %>% factor)
+
+cat("\nResearch vs Diagnostic detection of somatic WT1 (first variant):\n")
+print(somatic_comparison)
+
+# =====================================
+# SOMATIC WT1 VARIANT #2 ANALYSIS
+# =====================================
+
+cat("\nSOMATIC WT1 VARIANT #2 ANALYSIS:\n")
+cat("=================================\n")
+
+# Filter samples that have somatic WT1 variant #2 information
+samples_with_diagnostics_somatic2 <- samples_with_diagnostics_somatic %>% 
+  filter(!is.na(wt1_somatic_Diagnostics_2), 
+         wt1_somatic_Diagnostics_2 != "NA")
+
+cat("Samples with somatic WT1 variant #2 diagnostic information:", nrow(samples_with_diagnostics_somatic2), "\n")
+
+if(nrow(samples_with_diagnostics_somatic2) > 0) {
+  # Create binary classification for somatic variant #2 (research)
+  samples_with_diagnostics_somatic2 <- samples_with_diagnostics_somatic2 %>%
+    mutate(
+      WT1_somatic_2_binary = case_when(
+        wt1_somatic_2_oncoplot_label == "None_WT1" ~ "No",
+        wt1_somatic_2_oncoplot_label %in% variantsWT1 ~ "Yes",
+        TRUE ~ NA
+      )
+    )
+  
+  # Comparison table for variant #2
+  somatic_comparison_2 <- table(samples_with_diagnostics_somatic2$WT1_somatic_2_binary, 
+                                samples_with_diagnostics_somatic2$wt1_somatic_Diagnostics_2 %>% factor)
+  
+  cat("\nResearch vs Diagnostic detection of somatic WT1 (second variant):\n")
+  print(somatic_comparison_2)
+  
+  # Show detailed breakdown
+  cat("\nDetailed breakdown of somatic WT1 variant #2:\n")
+  detailed_2 <- samples_with_diagnostics_somatic2 %>% 
+    select(Internal_Patient_ID, M_Label, wt1_somatic_2_oncoplot_label, WT1_somatic_2_binary, wt1_somatic_Diagnostics_2)
+  print(detailed_2)
+} else {
+  cat("No samples with somatic WT1 variant #2 diagnostic information found\n")
+}
+
+
+# =====================================
+# SUMMARY STATISTICS
+# =====================================
+
+cat("\nSUMMARY:\n")
+cat("========\n")
+{cat("Germline WT1:\n")
+  cat("- Total number of samples with germline WT1 variants identified:", sum(samples_with_diagnostics_germline$WT1_simplified_germline == "Yes"), "\n")
+  cat("- Number of samples with germline WT1 variants identified by diagnostics:", 
+      sum(samples_with_diagnostics_germline$WT1_simplified_germline == "Yes" & 
+            samples_with_diagnostics_germline$wt1_germline_Diagnostics == "Found", na.rm = TRUE), "\n")
+  cat("- Number of samples with germline WT1 variants missed by diagnostics:", 
+      sum(samples_with_diagnostics_germline$WT1_simplified_germline == "Yes" & 
+            samples_with_diagnostics_germline$wt1_germline_Diagnostics == "NotFound", na.rm = TRUE), "\n")
+  cat("- M-Label of samples with germline WT1 variants missed by diagnostics:", 
+      samples_with_diagnostics_germline %>% 
+        filter(WT1_simplified_germline == "Yes" & wt1_germline_Diagnostics == "NotFound") %>% 
+        pull(M_Label), "\n\n")
+}
+
+{cat("Somatic WT1 (variant #1):\n")
+  cat("- Samples tested diagnostically:", nrow(samples_with_diagnostics_somatic), "\n")
+  cat("- Somatic Variants (1) found by diagnostics:",  sum(samples_with_diagnostics_somatic$WT1_simplified_somatic == "Yes" & 
+                                                             samples_with_diagnostics_somatic$wt1_somatic_Diagnostics_1 == "Found", na.rm = TRUE), "\n")
+  cat("- Somatic Variants (1) missed by diagnostics:", sum(samples_with_diagnostics_somatic$WT1_simplified_somatic == "Yes" & 
+                                                             samples_with_diagnostics_somatic$wt1_somatic_Diagnostics_1 == "NotFound", na.rm = TRUE), "\n")
+  cat("- M-Label of samples with somatic WT1 variants (1) missed by diagnostics:", 
+      samples_with_diagnostics_somatic %>% 
+        filter(WT1_simplified_somatic == "Yes" & wt1_somatic_Diagnostics_1 == "NotFound") %>% 
+        pull(M_Label), "\n\n")
+}
+
+{cat("Somatic WT1 (variant #2):\n")
+  cat("- Samples tested diagnostically:", nrow(samples_with_diagnostics_somatic2), "\n")
+  cat("- Somatic Variants (2) found by diagnostics:",  sum(samples_with_diagnostics_somatic2$WT1_somatic_2_binary == "Yes" & 
+                                                             samples_with_diagnostics_somatic2$wt1_somatic_Diagnostics_2 == "Found", na.rm = TRUE), "\n")
+  cat("- Somatic Variants (2) missed by diagnostics:", sum(samples_with_diagnostics_somatic2$WT1_somatic_2_binary == "Yes" & 
+                                                             samples_with_diagnostics_somatic2$wt1_somatic_Diagnostics_2 == "NotFound", na.rm = TRUE), "\n")
+  cat("- M-Label of samples with somatic WT1 variants (2) missed by diagnostics:", 
+      samples_with_diagnostics_somatic2 %>% 
+        filter(WT1_somatic_2_binary == "Yes" & wt1_somatic_Diagnostics_2 == "NotFound") %>% 
+        pull(M_Label), "\n\n")
+}
+
+```
+
+# Save sample sheet
+```{r}
+saveRDS(sample_sheet_simplified, file = file.path(parameters$PROCESSED_DATA_FOLDER, "masterSampleSheet_after_figure3.rds"))
+```
+
