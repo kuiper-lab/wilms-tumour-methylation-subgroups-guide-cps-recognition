@@ -1,0 +1,2096 @@
+---
+title: "Classifier"
+author: "Franziska Oberhammer"
+date: "2026-09-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup & Environment
+Loading core dependencies, helper utilities, and configuration directories.
+
+```{r load_packages, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages({
+  library(circlize)
+  library(doParallel)
+  library(dplyr)
+  library(magrittr)
+  library(qs)
+  library(RColorBrewer)
+  library(pROC)
+  library(tidyverse)
+  library(randomForest)
+  library(umap)
+  library(data.table)
+  library(patchwork)
+  library(ggalluvial)
+  library()
+  library(uwot)
+  library(tibble)
+})
+```
+
+
+
+```{r Configuration}
+parameters <- list()
+
+# Directory Configuration
+parameters$PROJECT_FOLDER        <- "/hpc/pmc_kuiper/Wilms/METHYLATION" 
+parameters$CODE_FOLDER           <- file.path(parameters$PROJECT_FOLDER, "CODE") 
+parameters$DATA_FOLDER           <- file.path(parameters$PROJECT_FOLDER, "DATA") 
+parameters$ANALYSIS_FOLDER       <- file.path(parameters$PROJECT_FOLDER, "ANALYSIS") 
+parameters$PROCESSED_DATA_FOLDER <- file.path(parameters$ANALYSIS_FOLDER, "PROCESSED_DATA") 
+parameters$RESULTS_FOLDER        <- file.path(parameters$PROJECT_FOLDER, "RESULTS")
+
+# Input Data Paths (Training Cohort)
+parameters$sampleSheetTrainCohort                <- file.path(parameters$PROCESSED_DATA_FOLDER, "masterSampleSheet_after_figure3.rds")
+parameters$betaValuesTrainCohort_raw             <- file.path(parameters$PROCESSED_DATA_FOLDER, "betas_V1V2_combined_probeFiltered_SampleQCFiltered_SNPsQC_postMortemAndVersionFiltered_SexMissmatchFiltered.qs")
+parameters$betaValuesTrainCohort_batchCorrected  <- file.path(parameters$PROCESSED_DATA_FOLDER, "betas_V1V2_combined_probeFiltered_SampleQCFiltered_SNPsQC_postMortemAndVersionFiltered_batchCorrected.qs")
+parameters$CLUSTERING_TrainCohort                <- file.path(parameters$ANALYSIS_FOLDER, 
+                                                              "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_5000mvCpGs_manuscript/innerLinkageward.D2_finalLinkageward.D2_clusterAlghc_distanceMethpearson/clustering_tree_5clusters.qs")
+
+# Source Custom Utilities
+source(file.path(parameters$CODE_FOLDER, "00_theme_Publication.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_colour_palettes.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WT_helper_functions.R"))
+source(file.path(parameters$CODE_FOLDER, "00_WTClassifierMnMHelperFunctions.R"))
+```
+
+
+
+2. Load & Preprocess Training Cohort
+
+Loading sample sheets and methylation matrices for the discovery training cohort.
+
+```{r LoadData}
+sample_sheets <- list()
+
+# Load training metadata
+sample_sheets$sample_sheet_train    <- readRDS(parameters$sampleSheetTrainCohort) 
+
+# Load raw and batch-corrected beta value matrices
+betas_TrainCohort_raw <- qread(parameters$betaValuesTrainCohort_raw)
+betas_TrainCohort_batchCorrected <- as.data.frame(qread(parameters$betaValuesTrainCohort_batchCorrected))
+clustering_Train <- qread(parameters$CLUSTERING_TrainCohort)  
+```
+
+```{r PrepData}
+# Filter CpGs exceeding missingness threshold (> 11% NAs)
+betas_TrainCohort_raw <- betas_TrainCohort_raw[rowMeans(is.na(betas_TrainCohort_raw)) < 0.11, ]
+betas_TrainCohort_batchCorrected <- betas_TrainCohort_batchCorrected[rowMeans(is.na(betas_TrainCohort_batchCorrected)) < 0.11, ]
+
+
+# Preprocess methylation beta matrices (keep only train cohort samples)
+betas_TrainCohort_raw <- betas_TrainCohort_raw %>% 
+  dplyr::select(-c("CI_V1", "BC", "EB"))
+
+betas_TrainCohort_batchCorrected <- betas_TrainCohort_batchCorrected %>% 
+  dplyr::select(-c("EB")) #CI_V1 and BC already removed in batch corrected data
+
+
+# Standardize sample column names by removing version suffixes
+colnames(betas_TrainCohort_raw) <- sub("_.*", "", colnames(betas_TrainCohort_raw))
+
+colnames(betas_TrainCohort_batchCorrected) <- sub("_.*", "", colnames(betas_TrainCohort_batchCorrected))
+
+
+# Change labels to M-labels
+colnames(betas_TrainCohort_raw) <- sample_sheets$sample_sheet_train$M_Label[match(colnames(betas_TrainCohort_raw), sample_sheets$sample_sheet_train$Internal_Patient_ID)]
+colnames(betas_TrainCohort_batchCorrected) <- sample_sheets$sample_sheet_train$M_Label[match(colnames(betas_TrainCohort_batchCorrected), sample_sheets$sample_sheet_train$Internal_Patient_ID)]
+
+
+# check whether samples are in same order as in sample sheet
+stopifnot(colnames(betas_TrainCohort_raw) == sample_sheets$sample_sheet_train$M_Label)
+stopifnot(colnames(betas_TrainCohort_batchCorrected) == sample_sheets$sample_sheet_train$M_Label)
+```
+
+
+# Classifier
+
+## 10-Fold Cross-Validation Framework
+Performing stratified 10-fold cross-validation with ANOVA feature selection and Random Forest feature importance reduction.
+All additional classifier functions can be found in 00_WTClassifierMnMHelperFunctions.R
+Note: The 10-fold cross-validation framework used here was adapted from the MnM RNA-seq classifier (PMC MnM Repositor: https://github.com/princessmaximacenter/MnM/tree/main). While original function architectures and variable names have been retained for workflow alignment, the pipeline has been modified to process DNA methylation M-values and variance-based probe selection instead of gene expression counts. The input should be a beta-matrix, it will be converted to M-values.
+
+```{r}
+countDataRef <-  betas_TrainCohort_batchCorrected %>%  as.matrix() 
+metaDataRef <-  sample_sheets$sample_sheet_train %>% 
+  mutate(Corrected_histology = as.character(Corrected_histology))
+
+
+classColumn  <- "DNAm_5_cluster_letters"
+higherClassColumn <-  "DNAm_5_cluster_letters_splitIn2"
+domainColumn <- "Corrected_histology"
+sampleColumn = "M_Label"
+meanExpression = 0
+nANOVAgenes = 10000
+nModels = 100 
+ntree = 500
+nFeatures = 5000
+maxSamplesPerType = NA
+whichSeed = 1
+
+outputDir <- "/hpc/pmc_kuiper/Wilms/METHYLATION/ANALYSIS/CLASSIFIER/ModelAndCpGs"
+
+`%notin%` <- base::Negate(`%in%`)
+
+# Check input ------------------------------------------
+checkFormatInputData(sampleColumn = sampleColumn,
+                     classColumn = classColumn,
+                     higherClassColumn = higherClassColumn,
+                     domainColumn = domainColumn,
+                     metaDataRef = metaDataRef,
+                     countDataRef = countDataRef,
+                     outputDir = outputDir,
+                     saveModel = T)
+
+base::rownames(metaDataRef) <- metaDataRef[, sampleColumn]
+
+# Check whether any group has too few samples
+tumorEntitiesWithTooFewSamples <- base::table(metaDataRef[,classColumn])[base::table(metaDataRef[,classColumn]) < 3] %>% base::names()
+if (base::length(tumorEntitiesWithTooFewSamples) >0) {
+  
+  metaDataRef %<>% dplyr::filter(!!dplyr::sym(classColumn) %notin% tumorEntitiesWithTooFewSamples)
+  base::cat("\nYou have labels within your dataset that have less than 3 available samples. \nPlease note samples with these labels have been removed.\n")
+}
+
+# Convert beta matrix to M-value scale for classification modeling------------------------------------
+countDataRef <- countDataRef[, base::rownames(metaDataRef)]
+countDataRef <- sesame::BetaValueToMValue(countDataRef)
+
+# Set up output directory------------------------------------------------------
+directory <- outputDir
+modelDirectory <- base::paste0(directory, "/seed", whichSeed)
+
+if (!base::dir.exists(modelDirectory)){
+  base::dir.create(modelDirectory)
+}
+
+
+# Specify max samples per tumor type------------------------------------------
+if (base::is.na(maxSamplesPerType)) {
+  maxSamplesPerType <- base::ceiling(stats::median(base::table(metaDataRef[, classColumn])))
+}
+countDataRefTransformed <- countDataRef %>% base::t() %>% base::as.data.frame()
+
+# High-variance feature filtering (Top 10% most variable CpGs)
+countDataRef <- countDataRef[complete.cases(countDataRef), ]
+varVals <- apply(countDataRef, 1, var, na.rm = TRUE)   
+threshold <- quantile(varVals, 0.9)             
+countDataRef <- countDataRef[varVals >= threshold, ]
+
+
+cat("\nWe will now start with the cross-validation\n")
+# Set seed for reproducibility
+base::set.seed(whichSeed)
+```
+
+
+```{r}
+# Create splits for cross-validation setup with equal distribution of tumor types------------------------------
+folds <- caret::createFolds(metaDataRef[ , classColumn], k = 10, returnTrain = TRUE, list = TRUE) 
+
+featuresAndModels <- foreach::foreach(i=c(1:base::length(folds))) %dopar%{
+  
+  # Select CpGs and metadata for training samples
+  metaDataCV <- metaDataRef[folds[[i]],]
+  countDataCV <- countDataRef[, folds[[i]]]
+  
+  # Run an ANOVA to select the top n CpGs from the training data for use in the further classification process
+  base::set.seed(whichSeed)
+  interestingANOVAgenes <- selectAnovaGenes(metaDataRef  = metaDataCV,
+                                            countDataRef  = countDataCV,
+                                            nANOVAgenes = nANOVAgenes,
+                                            classColumn = classColumn)
+  
+  base::cat(base::paste("Found interesting ANOVA genes for Fold ", i, "\n"))
+  
+  # Select the ANOVA genes within the log-transformed data
+  dataLogCV <- countDataRefTransformed[,interestingANOVAgenes]
+  
+  # Select biomaterial IDs as training data per model
+  base::set.seed(whichSeed)
+  samplesTrainDefList <- obtainTrainData(metaDataRef = metaDataCV,
+                                         classColumn = classColumn,
+                                         nModels = nModels,
+                                         maxSamplesPerType = maxSamplesPerType)
+  
+  # Select training data
+  dataCV <- dataLogCV[folds[[i]], ]
+  
+  # Add class label to the dataset
+  dataCV$class <- base::as.character(metaDataRef[rownames(dataCV),classColumn])
+  
+  # Also create test data and specify which biomaterial IDs are in there
+  testDataCV <- dataLogCV[ -folds[[i]], ]
+  
+  # Reduce features using RF feature importance for accuracy
+  base::cat(base::paste("Working on reducing Features for Fold", i, "\n"))
+  reducedFeatures <- reduceFeatures(dataTrain = dataCV,
+                                    samplesTrainDefList = samplesTrainDefList,
+                                    ntree = 500,
+                                    nModels = nModels,
+                                    nFeatures = nFeatures,
+                                    nANOVAgenes = nANOVAgenes
+  )
+  
+  dataCV <- dataCV[,c(reducedFeatures, "class")]
+  
+  # Reduce features of testing data
+  testDataCVReduced <- testDataCV[,reducedFeatures]
+  base::cat("\nInitiating RF\n")
+  
+  # Start the modelling of the data within the different compositions of training data
+  base::set.seed(whichSeed)
+  modelList <- obtainModelsMinorityClassifier(dataTrain = dataCV,
+                                              #dataSynth = data
+                                              samplesTrainDefList = samplesTrainDefList,
+                                              nModels = nModels,
+                                              ntree = ntree)
+  
+  base::cat(base::paste("Generated all models for Fold ", i, "\n"))
+  
+  # Find the predictions for the test data
+  result <- predictTest(modelList, testDataCVReduced)
+  
+  # Combine results, generated models and selected features into a list
+  featuresAndModels <- list(result = result,
+                            modelList = modelList,
+                            reducedFeatures = reducedFeatures)
+  
+  # In the end you will end up with the resulting classifications per tumor sample,
+  # the generated models and if feature reduction took place the features chosen per fold.
+  return(featuresAndModels)
+}
+base::cat("\nFinished with generating models and results\n")
+
+
+# Aggregate multi-fold classification predictions
+# This is done looping over all folds.
+probabilityList     <- list()
+modelList           <- list()
+reducedFeaturesList <- list()
+
+for (i in seq(1:base::length(featuresAndModels))) {
+  result <- featuresAndModels[[i]][["result"]]
+  
+  # Store (if required) models per fold within a list
+  modelList[[i]] <- featuresAndModels[[i]][["modelList"]]
+  
+  # Store reduced features per fold within a list
+  reducedFeaturesList[[i]]  <- featuresAndModels[[i]][["reducedFeatures"]]
+  
+  classificationResults <- convertResultToClassification(result = result,
+                                                         metaDataRef = metaDataRef,
+                                                         addOriginalCall = T,
+                                                         classColumn = classColumn)
+  
+  probabilityList[[i]] <- classificationResults$probabilityList
+  ultimatePredictions <- classificationResults$classifications
+  
+  # Add each fold to a dataframe that combines all results
+  if (i == 1) {
+    wrongClassifications <- ultimatePredictions[ultimatePredictions$predict != ultimatePredictions$originalCall,]
+    classifications <- ultimatePredictions
+  } else {
+    wrongClassifications <- rbind(wrongClassifications, ultimatePredictions[ultimatePredictions$predict != ultimatePredictions$originalCall,])
+    classifications <- rbind(classifications, ultimatePredictions)
+  }
+}
+
+# Check the accuracy of the current run
+accuracy <- base::sum(classifications$predict == classifications$originalCall) / base::length(classifications$originalCall)
+base::cat(paste("\naccuracy: ", accuracy, "\n"))
+
+# Store the settings of the classifier run within the resulting object
+metaDataRun <- data.frame(nModels = nModels,
+                          classColumn = classColumn,
+                          higherClassColumn = higherClassColumn,
+                          domainColumn = domainColumn,
+                          maxSamplesPerType = maxSamplesPerType,
+                          nANOVAgenes = nANOVAgenes,
+                          nFeatures = nFeatures,
+                          whichSeed = whichSeed)
+
+crossValidationMinorityResults <- list(classifications = classifications,
+                                       wrongClassifications = wrongClassifications,
+                                       probabilityList = probabilityList,
+                                       reducedFeaturesList = reducedFeaturesList,
+                                       metaDataRef = metaDataRef,
+                                       metaDataRun = metaDataRun)
+
+
+base::cat("\nWe have finished the classification process. Please find your results in the generated object.\n")
+filename <- base::paste0(modelDirectory, "/crossValidationMinorityResults.rds")
+
+# base::saveRDS(crossValidationMinorityResults, file = filename)
+base::cat(base::paste0("Please find the generated R-object with the classification results within ", filename, "\n"))
+return(crossValidationMinorityResults)
+
+filenameFeaturesAndModels <- base::paste0(modelDirectory, "/FeaturesAndModels.rds")
+# base::saveRDS(featuresAndModels, file = filenameFeaturesAndModels) #uncomment if features&models should be saved
+```
+
+```{r}
+#Note: Executing the 10-fold cross-validation pipeline is computationally intensive. 
+# To save time, you can run the cross-validation once, serialize the output object, 
+# and reload it for subsequent downstream analyses
+crossValidationMinorityResults <- readRDS(filename)
+FeaturesAndModels <- readRDS(base::paste0(filenameFeaturesAndModels))
+
+```
+
+
+*classifications*: All classifications for the 10x-crossvalidation setup of M&M on the reference cohort
+*wrongClassifications*: All classification errors, meaning the predict is not equal to the originalCall. 
+*probabilityList*: Contains how many models voted for a specific class label within the Minority classifier
+*reducedFeaturesList*: Contains which RNA-transcripts were used as features within the final model generation of the Minority classifier
+*metaDataRef*: Reference metadata used to generate class models
+*metaDataRun*: Stored the settings that were used to run the Minority classifier with. Used for further downstream analyses.
+
+
+
+
+
+
+## Cross-validation Performance & Metrics
+Calculating per-class and macro-averaged metrics and constructing cross-validation confusion matrices.
+
+### Overall Performance (Cross validation)
+
+```{r}
+# Compute confusion matrix over all cross-validation folds
+cm <- caret::confusionMatrix(factor(crossValidationMinorityResults$classifications$predict, levels = c("1b", "1a", "2a", "2b", "2c")), reference = factor(crossValidationMinorityResults$classifications$originalCall, levels = c("1b", "1a", "2a", "2b", "2c")))
+
+# extract F1 score for all classes
+crossvalidation_metrics        <- cm[["byClass"]] %>% as.data.frame()
+crossvalidation_metrics$Class  <-sub("Class: ", "", rownames(crossvalidation_metrics))
+metric_order                   <- rev(c("Specificity", "Sensitivity", "Precision", "F1", "Balanced Accuracy"))# Define metric importance order
+
+# Calculate macro-average performance
+overall_crossvalidation_metrics_macro <- crossvalidation_metrics %>%
+  select( Sensitivity, Specificity, Precision, F1, `Balanced Accuracy`) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value") %>% 
+  mutate(Metric = factor(Metric, levels = metric_order))
+
+
+# Plot Overall Performance
+overall_crossvalidation_metrics_macro_plot <- ggplot(overall_crossvalidation_metrics_macro, aes(x = Metric, y = Value)) +
+  geom_col(fill = "chocolate1", width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(
+    title = "Overall Performance (Macro-average)",
+    x = "",
+    y = ""
+  ) +
+  theme_Publication()
+
+overall_crossvalidation_metrics_macro_plot
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4BExtra_CrossValidation_OverallClassifierPerformance.pdf"), width = 8, height = 3.25)
+overall_crossvalidation_metrics_macro_plot
+# dev.off()
+
+overall_crossvalidation_metrics_macro_forCombinedPlot <- overall_crossvalidation_metrics_macro %>% as.data.frame() %>% 
+  mutate(Class = "Overall") %>% 
+  dplyr::relocate(Class, .before = Metric)
+
+
+
+
+# Performance per class -----------------------
+# Reshape long format per class
+crossvalidation_metrics_long <- crossvalidation_metrics %>%
+  select(Class, Sensitivity, Specificity, Precision, F1, `Balanced Accuracy`) %>%
+  pivot_longer(cols = -Class, names_to = "Metric", values_to = "Value")
+
+crossvalidation_metrics_long %>% 
+  filter(Class == "1b")
+crossValidationMetric_combined_long <- rbind(overall_crossvalidation_metrics_macro_forCombinedPlot, crossvalidation_metrics_long)
+
+# Prepare long-format data and factor the Metric
+crossValidationMetric_combined_long <- crossValidationMetric_combined_long %>%
+  filter(Metric %in% metric_order) %>%   # keep only selected metrics
+  mutate(
+    Metric = factor(Metric, levels = metric_order)
+  )
+
+# Prepare plot with overall performance + per class performance
+crossvalidation_metrics_plot <- ggplot(crossValidationMetric_combined_long, aes(x = factor(Class, levels = c("Overall", " ", names(colours_WT$DNAm_clustering2))), y = Value, fill = Class)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Metric, scales = "fixed", nrow = 1) +   # same y-axis for all facets
+  scale_fill_manual(values = c(colours_WT$DNAm_clustering2, "Overall" = "chocolate1"))+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Performance Metrics (Overall & per Class)",
+    x = "Class",
+    y = "",
+    fill = "DNAm cluster"
+  ) +
+  theme_Publication()
+
+crossvalidation_metrics_plot
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4B_CrossValidation_ClassifierPerformance_perClassAndOverall.pdf"), width = 12, height = 5)
+crossvalidation_metrics_plot
+# dev.off()
+
+# write.table(crossValidationMetric_combined_long, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4B_CrossValidation_ClassifierPerformance_perClassAndOverall.tsv"), sep = "\t")
+
+# write.table(crossValidationMinorityResults$classifications, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4B_CrossValidation_ClassifierResults.tsv"), sep = "\t")
+```
+
+
+### Performance filtering out low-confidence predictions (Cross validation)
+```{r}
+# Compute confusion matrix over all cross-validation folds without low-confidence predictions (probability <= 72%)
+crossValidationMinorityResults$classifications_wo_lowConfidence <- crossValidationMinorityResults$classifications %>% filter(probability > 72)
+
+cm_woLowConfidence <- caret::confusionMatrix(
+  factor(crossValidationMinorityResults$classifications_wo_lowConfidence$predict,  levels = c("1b", "1a", "2a", "2b", "2c")), 
+  reference = factor(crossValidationMinorityResults$classifications_wo_lowConfidence$originalCall, levels = c("1b", "1a", "2a", "2b", "2c")))
+
+# Calculate macro-average performance
+crossvalidation_metrics_woLowConfidence       <- cm_woLowConfidence[["byClass"]] %>% as.data.frame()
+crossvalidation_metrics_woLowConfidence$Class <-sub("Class: ", "", rownames(crossvalidation_metrics_woLowConfidence))
+
+
+overall_crossvalidation_metrics_macro_woLowConfidence <- crossvalidation_metrics_woLowConfidence %>%
+  select( Sensitivity, Specificity, Precision, F1, `Balanced Accuracy` ) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value") %>% 
+  mutate(Metric = factor(Metric, levels = metric_order))
+
+# Prepare overall metrics plot (without low confidence samples)
+overall_crossvalidation_metrics_macro_plot_woLowConfidence <- ggplot(overall_crossvalidation_metrics_macro_woLowConfidence, aes(x = Metric, y = Value)) +
+  geom_col(fill = "chocolate1", width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(
+    title = "Overall Performance (Macro-average)",
+    x = "",
+    y = ""
+  ) +
+  theme_Publication()
+
+overall_crossvalidation_metrics_macro_plot_woLowConfidence
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3", "S3Extra1_CrossValidation_OverallClassifierPerformance_woLowConfidence.pdf"), width = 8, height = 3.25)
+overall_crossvalidation_metrics_macro_plot_woLowConfidence
+# dev.off()
+
+
+
+# Performance per class -----
+# Reshape long format per class
+crossvalidation_metrics_long_woLowConfidence <- crossvalidation_metrics_woLowConfidence %>%
+  select( Class, Sensitivity, Specificity, Precision, F1, `Balanced Accuracy` ) %>%
+  pivot_longer( cols = -Class, names_to = "Metric", values_to = "Value" )
+
+crossvalidation_metrics_long_woLowConfidence <- crossvalidation_metrics_long_woLowConfidence %>%
+  filter(Metric %in% metric_order) %>%   # keep only selected metrics
+  mutate(
+    Metric = factor(Metric, levels = metric_order)
+  )
+
+# Prepare plot with overall performance + per class performance (without low confidence samples)
+crossvalidation_metrics_plot_woLowConfidence <- ggplot(crossvalidation_metrics_long_woLowConfidence, aes(x = Class, y = Value, fill = Class)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Metric, scales = "fixed", nrow = 1) +   # same y-axis for all facets
+  scale_fill_manual(values = colours_WT$DNAm_clustering2)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Performance Metrics per Class",
+    x = "Class",
+    y = "",
+    fill = "DNAm cluster"
+  ) +
+  theme_Publication()
+
+crossvalidation_metrics_plot_woLowConfidence
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3", "S3Extra2_CrossValidation_OverallClassifierPerformance_perClass_woLowConfidence.pdf"), width = 8.5, height = 3.25)
+crossvalidation_metrics_plot_woLowConfidence
+# dev.off()
+
+# write.table(crossValidationMinorityResults$classifications_wo_lowConfidence, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3B_CrossValidation_ClassifierResults_woLowConfidence.tsv"), sep = "\t")
+
+# write.table(crossvalidation_metrics_long_woLowConfidence, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3Extra2_CrossValidation_OverallClassifierPerformance_perClass_woLowConfidence.tsv"), sep = "\t")
+
+```
+
+
+### Confusion matrix (Cross validation)
+
+```{r}
+# prepare confusion matrix
+conf_mat_crossval <- make_conf_mat_simple(
+  crossValidationMinorityResults$classifications,
+  original_col = "originalCall",
+  predicted_col = "predict"
+)
+
+# prepare confusion matrix for cohort without low confidence samples
+conf_mat_crossval_wo_lowConfidence <- make_conf_mat_simple(
+  crossValidationMinorityResults$classifications_wo_lowConfidence,
+  original_col = "originalCall",
+  predicted_col = "predict"
+)
+
+
+# Plots of confusion matrix 
+plot_conf_mat(conf_mat_crossval, label_type = "count")
+plot_conf_mat(conf_mat_crossval, label_type = "count_prob")
+plot_conf_mat(conf_mat_crossval, label_type = "count_relfreq")
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4CExtra2_CrossValidation_ConfusionMatrix_CountRelativeFreq.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval, label_type = "count_relfreq")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4CExtra3_CrossValidation_ConfusionMatrix_CountProability.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval, label_type = "count_prob")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4C_CrossValidation_ConfusionMatrix_Count.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval, label_type = "count")
+# dev.off()
+
+# write.table(conf_mat_crossval %>% dplyr::select(originalCall, predict, n, avg_prob, freq), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4C_CrossValidation_ConfusionMatrix_Count.tsv"), sep = "\t")
+
+
+
+# Plots of confusion matrix without low confidence samples ------------------------
+plot_conf_mat(conf_mat_crossval_wo_lowConfidence, label_type = "count_prob")
+plot_conf_mat(conf_mat_crossval_wo_lowConfidence, label_type = "count_relfreq")
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3", "S3Extra3_CrossValidation_ConfusionMatrix_CountRelativeFreq_wo_lowConfidence.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval_wo_lowConfidence, label_type = "count_relfreq")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3", "S3Extra3_CrossValidation_ConfusionMatrix_CountProability_wo_lowConfidence.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval_wo_lowConfidence, label_type = "count_prob")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3", "S3B_CrossValidation_ConfusionMatrix_CountProability_wo_lowConfidence.pdf"), width = 7, height = 5)
+plot_conf_mat(conf_mat_crossval_wo_lowConfidence, label_type = "count")
+# dev.off()
+
+
+# write.table(conf_mat_crossval_wo_lowConfidence %>% dplyr::select(originalCall, predict, n, avg_prob, freq), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3B_CrossValidation_ConfusionMatrix_CountProability_wo_lowConfidence.tsv"), sep = "\t")
+
+```
+
+
+
+```{r}
+# Misclassified samples table
+misclassified_table <- crossValidationMinorityResults$classifications %>%
+  rownames_to_column(var = "sample") %>%
+  filter(originalCall != predict) %>%
+  select(
+    Sample = sample,
+    True_Class = originalCall,
+    Predicted_Class = predict,
+    Probability = probability
+  ) %>%
+  arrange(True_Class) 
+
+misclassified_table
+```
+
+
+### Snake diagram
+
+```{r}
+# Classification flow visualization
+
+# Prepare full classification flow
+all_flow <- crossValidationMinorityResults$classifications %>%
+  rownames_to_column(var = "sample") %>%
+  mutate(classification_status = if_else(originalCall == predict,
+                                         "Correct classification",
+                                         "Misclassified")) %>%
+  group_by(originalCall, predict, classification_status) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Define class order for legend
+class_order <- c("1a", "1b", "2a", "2b", "2c")  
+
+# Alluvial plot
+classification_flow_plot <- ggplot(all_flow,
+                                   aes(axis1 = originalCall, axis2 = predict, y = n, fill = originalCall)) +
+  geom_alluvium(aes(alpha = classification_status), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey80", color = "black") +
+  geom_text(stat = "stratum", aes(label = paste(after_stat(stratum), "\n", n)), size = 3) +
+  scale_x_discrete(limits = c("True class", "Predicted class")) +
+  scale_fill_manual(values = colours_WT$DNAm_clustering2,
+                    breaks = class_order,
+                    labels = class_order) +
+  scale_alpha_manual(values = c(`Correct classification` = 0.3,
+                                `Misclassified` = 1)) +  # highlight misclassified flows
+  theme_minimal() +
+  labs(title = "Classification Flow (Cross-Validation)",
+       y = "Number of samples", x = "", fill = "True class (DNAm cluster)", alpha = "Classification status")
+
+classification_flow_plot 
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3", "S3Extra6_CrossValidation_ClassificationFlow_misclassified.pdf"), width = 9, height = 8)
+classification_flow_plot 
+# dev.off()
+```
+
+
+
+# Create final classifier model
+```{r}
+saveModel = T
+correctRibo = F
+
+countDataOG <- countDataRef
+`%notin%` <<- base::Negate(`%in%`)
+
+checkFormatInputData(sampleColumn = sampleColumn,
+                     classColumn = classColumn,
+                     higherClassColumn = higherClassColumn,
+                     domainColumn = domainColumn,
+                     metaDataRef = metaDataRef,
+                     countDataRef = countDataRef,
+                     outputDir = outputDir,
+                     saveModel = saveModel)
+
+tumorEntitiesWithTooFewSamples <- base::table(metaDataRef[,classColumn])[base::table(metaDataRef[,classColumn]) < 3] %>% base::names()
+base::rownames(metaDataRef) <- metaDataRef[, sampleColumn]
+
+if (base::length(tumorEntitiesWithTooFewSamples) >0) {
+  
+  metaDataRef %<>% dplyr::filter(!!dplyr::sym(classColumn) %notin% tumorEntitiesWithTooFewSamples)
+  base::print("You have labels within your dataset that have less than 3 available samples.  Please note samples with these labels have been removed.")
+  #stop("You have tumor subtypes within your dataset that have less than 3 available samples. Please remove all tumor types with too few samples. ")
+  
+}
+
+# Convert beta matrix to M-value scale for classification modeling
+countDataRef <- countDataRef[, base::rownames(metaDataRef)]
+countDataRef <- sesame::BetaValueToMValue(countDataRef)
+
+# Prepare Output directory
+directory <- outputDir
+
+# transfer data
+dataRef <- countDataRef %>% base::t() %>% base::as.data.frame()
+
+
+# Specify max samples per tumor type
+if (base::is.na(maxSamplesPerType)) {
+  maxSamplesPerType <- base::ceiling(stats::median(base::table(metaDataRef[, classColumn])))
+}
+
+# Filter CpGs
+countDataRef <- countDataRef[complete.cases(countDataRef), ] 
+varVals <- apply(countDataRef, 1, var, na.rm = TRUE)   
+threshold <- quantile(varVals, 0.9)         
+countDataRef <- countDataRef[varVals >= threshold, ] 
+
+
+
+base::print("We will now start with the selection of ANOVA-genes") # --------------------------------------
+# Set seed for reproducibility
+base::set.seed(whichSeed)
+
+
+# Run an ANOVA to select the top n genes from the training data for use in the further classification process
+interestingANOVAgenes <- selectAnovaGenes(metaDataRef = metaDataRef,
+                                          countDataRef = countDataRef,
+                                          nANOVAgenes = nANOVAgenes, # How many ANOVA genes
+                                          classColumn = classColumn)
+
+base::print("We have finished with the ANOVA gene selection")
+# Select the ANOVA genes within the M-transformed data
+dataRef <- dataRef[ ,interestingANOVAgenes]
+
+# Select biomaterial IDs as training data per model
+base::set.seed(whichSeed)
+samplesTrainDefList <- obtainTrainData(metaDataRef = metaDataRef,
+                                       classColumn = classColumn,
+                                       nModels = nModels,
+                                       maxSamplesPerType = maxSamplesPerType)
+
+# Add class label to the dataset
+dataRef$class <- base::as.character(metaDataRef[rownames(dataRef),classColumn])
+
+base::print("Starting to reduce features")
+# Reduce features using RF feature importance for accuracy
+base::set.seed(whichSeed)
+reducedFeatures <- reduceFeatures(dataTrain = dataRef,
+                                  samplesTrainDefList = samplesTrainDefList,
+                                  ntree = 500,
+                                  nModels = nModels,
+                                  nFeatures = nFeatures,
+                                  nANOVAgenes = nANOVAgenes)
+
+
+dataRef <- dataRef[,c(reducedFeatures, "class")]
+
+base::print("Initiating RF")
+
+# Start the modelling of the data within the different compositions of training data
+base::set.seed(whichSeed)
+modelList <- obtainModelsMinorityClassifier(dataTrain = dataRef,
+                                            samplesTrainDefList = samplesTrainDefList,
+                                            nModels = nModels,
+                                            ntree = ntree)
+
+# Store the settings of the classifier run within the resulting object
+metaDataRun <- base::data.frame(nModels = nModels,
+                                classColumn = classColumn,
+                                higherClassColumn = higherClassColumn,
+                                domainColumn = domainColumn,
+                                maxSamplesPerType = maxSamplesPerType,
+                                nANOVAgenes = nANOVAgenes,
+                                nFeatures = nFeatures,
+                                whichSeed = whichSeed)
+
+createdModelsMinority <- base::list(modelList = modelList,
+                                    #                             riboModelList = riboModelList,
+                                    reducedFeatures = reducedFeatures,
+                                    metaDataRef = metaDataRef,
+                                    metaDataRun = metaDataRun,
+                                    countDataRef = countDataOG)
+
+
+filename_finalModel <- base::paste0(directory,  "/seed", whichSeed, "/createdModelsMinority.rds")
+# base::saveRDS(createdModelsMinority, file = filename_finalModel)
+# base::print(base::paste0("Please find the generated R-object with the created minority classification models within ", filename_finalModel))
+
+
+createdModelsMinority <- readRDS(filename_finalModel)
+
+```
+
+
+
+# Independent Validation Cohort 
+Evaluating model performance against internal and external validation datasets.
+
+## Setup Validation
+
+```{r setup Validation}
+parameters$sampleSheetValidationCohorts                <- file.path(parameters$PROCESSED_DATA_FOLDER, "mastersamplesheet_afterQC_validationCohort.rds")
+parameters$betaValuesValidationCohorts                 <- file.path(parameters$PROCESSED_DATA_FOLDER, "betas_V1V2_combined_probeFiltered_SampleQCFiltered_validationCohort.qs") 
+parameters$additionalMetadata_ExternalValidationCohort <- "/hpc/pmc_kuiper/Wilms/EXTERNAL_DATA/2025_Treger_CancerDiscovery_SomaticFootprintPredisposition/DATA/SampleSheetTreger.xlsx"
+```
+
+
+
+## Load Validation Data
+
+```{r}
+# Load beta value matrices
+betas_ValidationCohorts <- qread(parameters$betaValuesValidationCohorts) %>% 
+  dplyr::rename(DA_FFPE = DA) %>% 
+  dplyr::select(-"DA.1")
+
+
+# Load external metadata mapping
+sample_sheets$additionalMetadata_ExternalValidationCohort <- readxl::read_xlsx(parameters$additionalMetadata_ExternalValidationCohort)
+
+# Clean metadata and align patient labels
+sample_sheets$sample_sheet_validation <- readRDS(parameters$sampleSheetValidationCohorts) %>% 
+  mutate(
+    Internal_Patient_ID = ifelse(Internal_Patient_ID == "DA", "DA_FFPE", Internal_Patient_ID),
+    BatchDNAm = ifelse(grepl("PD([0-9])\\w+", Internal_Patient_ID), "ExternalValidation", "InternalValidation"),
+    bisConversionControl_testResult = as.logical(bisConversionControl_testResult),
+    M_Label = ifelse(is.na(M_Label), Internal_Patient_ID, M_Label)
+  ) %>% 
+  filter(Internal_Patient_ID %in% colnames(betas_ValidationCohorts)) %>% 
+  group_by(M_Label) %>%
+  mutate(
+    M_Label = if (n() == 1) {
+      M_Label
+    } else {
+      paste0(M_Label, "_", row_number())
+    }
+  ) %>%
+  ungroup()
+
+# Check dataset dimensions
+dim(betas_ValidationCohorts)
+dim(sample_sheets$sample_sheet_validation)
+
+# Synchronize matrix columns with sample sheet IDs
+betas_ValidationCohorts <- betas_ValidationCohorts[,sample_sheets$sample_sheet_validation$Internal_Patient_ID]
+
+#Rename betas to use M-value labels instead of Intenral IDs
+colnames(betas_ValidationCohorts) <- sample_sheets$sample_sheet_validation$M_Label[match(colnames(betas_ValidationCohorts), sample_sheets$sample_sheet_validation$Internal_Patient_ID)]
+
+stopifnot(colnames(betas_ValidationCohorts) == sample_sheets$sample_sheet_validation$M_Label)
+
+
+
+# Separate Internal & External Validation Cohorts ---------------------------
+sample_sheets$sample_sheet_internalValidation <- sample_sheets$sample_sheet_validation %>% filter(BatchDNAm == "InternalValidation")%>% 
+  select(where(~ !any(is.na(.))))
+
+sample_sheets$sample_sheet_externalValidation <- sample_sheets$sample_sheet_validation %>% filter(BatchDNAm == "ExternalValidation") %>% 
+  select(where(~ !any(is.na(.))))
+
+# check number of samples per cohort
+dim(sample_sheets$sample_sheet_internalValidation)
+dim(sample_sheets$sample_sheet_externalValidation)
+```
+
+
+
+
+## IC1/IC2 Methylation Status of Internal & External Validation Cohorts
+
+```{r}
+# Load Array Manifests & Extract Imprinting Control Regions (IC1/IC2)
+annoV1 <- read.delim(file.path(parameters$DATA_FOLDER, "BIN", "EPIC.hg38.manifest.tsv"))
+annoV2 <- read.delim(file.path(parameters$DATA_FOLDER, "BIN", "EPICv2.hg38.manifest.tsv"))
+
+
+# get CpGs that are in IC1
+CpGs_IC1_EPICv1 <- annoV1 %>% 
+  filter(CpG_chrm == "chr11", CpG_beg >= 1998149, CpG_end <=1998777) %>% pull(Probe_ID)
+CpGs_IC1_EPICv2 <- annoV1 %>% 
+  filter(CpG_chrm == "chr11", CpG_beg >= 1998149, CpG_end <=1998777) %>% pull(Probe_ID)
+stopifnot(all(CpGs_IC1_EPICv1==CpGs_IC1_EPICv2))
+
+# get CpGs that are in IC2
+CpGs_IC2_EPICv1 <- annoV1 %>% 
+  filter(CpG_chrm == "chr11", CpG_beg >= 2699310, CpG_end <=2700164) %>% pull(Probe_ID)
+CpGs_IC2_EPICv2 <- annoV1 %>% 
+  filter(CpG_chrm == "chr11", CpG_beg >= 2699310, CpG_end <=2700164) %>% pull(Probe_ID)
+stopifnot(all(CpGs_IC2_EPICv2 == CpGs_IC2_EPICv1))
+
+
+# Extract validation cohort beta values for IC1 and IC2 probes
+CpGs_IC1 <- CpGs_IC1_EPICv1[CpGs_IC1_EPICv1 %in% rownames(betas_ValidationCohorts)]
+CpGs_IC2 <- CpGs_IC2_EPICv1[CpGs_IC2_EPICv1 %in% rownames(betas_ValidationCohorts)]
+
+IC1_meth <-betas_ValidationCohorts[CpGs_IC1,] %>% t()
+IC2_meth <-betas_ValidationCohorts[CpGs_IC2,] %>% t()
+
+colnames(IC1_meth) <- paste0(colnames(IC1_meth), "_IC1")
+colnames(IC2_meth) <- paste0(colnames(IC2_meth), "_IC2")
+
+
+IC1_IC2_combined <- cbind(IC1_meth, IC2_meth)
+IC1_IC2_combined <- IC1_IC2_combined[match(sample_sheets$sample_sheet_validation$M_Label, rownames(IC1_IC2_combined)),] 
+
+IC1_IC2_combined_scaled_transformed <- IC1_IC2_combined %>% scale() %>% t()
+
+# clean global environment
+rm(annoV1, annoV2, CpGs_IC1_EPICv1, CpGs_IC1_EPICv2, CpGs_IC2_EPICv1, CpGs_IC2_EPICv2, CpGs_IC1, CpGs_IC2, IC1_meth, IC2_meth)
+
+
+
+# Consensus Clustering of CpGs in IC1 IC2 ----------------------------------------
+innerLinkage <- "ward.D2"
+finalLinkage <- "ward.D2"
+clusterAlg <- "hc"
+distanceMeth <- "euclidean"
+
+results = ConsensusClusterPlus::ConsensusClusterPlus(
+  IC1_IC2_combined_scaled_transformed,
+  maxK=16,
+  reps=1000,
+  pItem=0.8,
+  pFeature=1,
+  innerLinkage = innerLinkage,
+  finalLinkage = finalLinkage,
+  clusterAlg = clusterAlg,
+  distance = distanceMeth,
+  title = file.path(parameters$ANALYSIS_FOLDER,
+                    "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_IC1_IC2_ValidationCohorts",
+                    paste0("innerLinkage", innerLinkage,
+                           "_finalLinkage", finalLinkage,
+                           "_clusterAlg", clusterAlg,
+                           "_distanceMeth", distanceMeth)),
+  seed=1262118388.71279,
+  # plot="pdf" # Uncomment to export consensus cluster decision plots
+)
+
+# Calculate Item Consensus
+icl = ConsensusClusterPlus::calcICL(
+  results,
+  title = file.path(parameters$ANALYSIS_FOLDER,
+                    "EXPLORATORY_ANALYSIS/clustering/ConsensusClusterPlus_IC1_IC2_ValidationCohorts",
+                    paste0("innerLinkage", innerLinkage,
+                           "_finalLinkage", finalLinkage,
+                           "_clusterAlg", clusterAlg,
+                           "_distanceMeth", distanceMeth)),
+  # plot = "pdf"  # Uncomment to export plots
+)
+
+
+# 4 clusters were found to be most stable 
+IC1IC2_consensus_clustering <- results[[4]]
+IC1IC2_consensus_clustering_tree <- IC1IC2_consensus_clustering$consensusTree
+IC1IC2_consensus_clustering_tree$labels <- rownames(IC1_IC2_combined)
+IC1IC2_consensus_clustering$consensusClass
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3", "S3D_ValidationCohorts_IC1IC2_withoutRownames.pdf"), width = 7, height = 7)
+ComplexHeatmap::Heatmap(IC1_IC2_combined, cluster_columns = FALSE,
+                        col = circlize::colorRamp2(seq(0,1,0.01), colours_WT$meth),
+                        cluster_rows= as.dendrogram(IC1IC2_consensus_clustering_tree),
+                        row_split = 4,
+                        name = "beta-value",
+                        show_row_names = FALSE,
+                        row_names_side = "left", 
+                        row_dend_side = "right",
+                        clustering_method_rows = "complete")
+# dev.off()
+
+
+# write.table(IC1_IC2_combined, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3D_ValidationCohorts_IC1_IC2.tsv"), sep = "\t")
+
+
+# Annotate Imprinting Status & Merge with Sample Sheets -------------------------------------------
+IC1_IC2_clustering <- data.frame("M_Label" = names(IC1IC2_consensus_clustering$consensusClass),
+                                 "IC1_IC2_clustering" = (IC1IC2_consensus_clustering$consensusClass))
+
+# Map known representative samples to define cluster-wide imprinting classes
+IC1_IC2_clustering <- IC1_IC2_clustering %>%
+  dplyr::mutate(
+    imprinting = case_when(
+      M_Label == "PD49173a" ~ "pUPD",
+      M_Label == "PD52241a" ~ "hyper",
+      M_Label == "PD52201a" ~ "normal",
+      M_Label == "PD50696a" ~ "intermediate",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Propagate mapped imprinting state across all cluster members
+IC1_IC2_clustering_imprintingInfo <- IC1_IC2_clustering %>%
+  dplyr::group_by(IC1_IC2_clustering) %>%
+  dplyr::mutate(
+    imprinting = dplyr::first(na.omit(imprinting))
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    IC1_IC2_clustering = factor(IC1_IC2_clustering),
+    imprinting = factor(imprinting)
+  )
+
+
+# write.table(left_join(IC1_IC2_combined %>% as.data.frame() %>% rownames_to_column("M_Label"), IC1_IC2_clustering_imprintingInfo %>% dplyr::select(M_Label, imprinting)), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3D_ValidationCohorts_IC1IC2Methylation_and_imprintingStatus.tsv"), sep = "\t")
+
+
+# Merge imprinting status back into metadata tables
+sample_sheets$sample_sheet_validation <- sample_sheets$sample_sheet_validation %>%
+  left_join(
+    IC1_IC2_clustering_imprintingInfo %>%
+      select(M_Label, imprinting_ref = imprinting),
+    by = "M_Label"
+  ) %>%
+  mutate(imprinting = coalesce(imprinting, imprinting_ref), 
+         imprinting_ref = NULL) 
+
+sample_sheets$sample_sheet_externalValidation <- sample_sheets$sample_sheet_externalValidation %>%
+  left_join(
+    IC1_IC2_clustering_imprintingInfo %>%
+      select(M_Label, imprinting),
+    by = "M_Label"
+  ) 
+
+sample_sheets$sample_sheet_internalValidation <- sample_sheets$sample_sheet_internalValidation %>%
+  left_join(
+    IC1_IC2_clustering_imprintingInfo %>%
+      select(M_Label, imprinting),
+    by = "M_Label"
+  )
+sample_sheets$sample_sheet_internalValidation
+```
+
+
+
+
+## Run Classifier on Validation Cohorts
+
+### Internal Validation cohort 
+
+#### Classification
+
+```{r}
+validationInternalBetaValues_reducedFeature <- betas_ValidationCohorts[createdModelsMinority$reducedFeatures,sample_sheets$sample_sheet_internalValidation$M_Label]
+
+outputDirValidation <- "/hpc/pmc_kuiper/Wilms/METHYLATION/ANALYSIS/CLASSIFIER/ModelAndCpGs/seed1/InternalAndExternalValidationCohort"
+
+`%notin%` <<- Negate(`%in%`)
+
+# Execute classifier on internal cohort
+result_internal <- runMinorityClassifier(
+  createdModelsMinorityList = createdModelsMinority,
+  MethDataNew = validationInternalBetaValues_reducedFeature,
+  outputDir = file.path(outputDirValidation, "Internal"),
+  sample_sheet = sample_sheets$sample_sheet_internalValidation,
+  whichKimputation = 3,
+  saveModel = TRUE
+)
+
+# Append binary call (Cluster 1b vs. Other)
+result_internal$classifications <- result_internal$classifications %>% 
+  mutate(Prediction_binary = ifelse(predict == "1b", "1b", "Other"))
+
+result_internal$classifications
+result_internal$metaDataRun
+
+# write.table(result_internal$classifications, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4E_ValidationInternal_ClassifierResults.tsv"), sep = "\t")
+
+
+```
+
+#### Confusion matrix
+
+```{r}
+# 1. Map Known WT1 Mutational Status (Somatic, Germline, Combined) ---------------------------------
+
+internalValidationSamples <- list()
+
+# Somatic
+internalValidationSamples$internalValidationSamples_WT1_somatic_MLabel <- c("M953AAF") # this is the patient where we could not find a variant, but the expression is so low in the tumour that there MUST be a variant. Additionally the whole chr11 is CN-LOH! so we consider it PV WT1
+
+# germline
+internalValidationSamples$internalValidationSamples_WT1_germline_MLabel <- c("M830AAE", "M873AAF", "M065AAG_1", "M065AAG_2")
+
+# combined
+internalValidationSamples$internalValidationSamples_WT1_combined <-
+  unique(c(internalValidationSamples$internalValidationSamples_WT1_somatic_PatientID,
+           internalValidationSamples$internalValidationSamples_WT1_somatic_MLabel,
+           internalValidationSamples$internalValidationSamples_WT1_germline_PatientID,
+           internalValidationSamples$internalValidationSamples_WT1_germline_MLabel))
+
+
+# 2. Build Internal Validation Confusion Matrix Dataframes ---------------------------------
+
+result_internal$classifications_inclWT1 <- result_internal$classifications %>% rownames_to_column("M_Label") %>%
+  mutate(original_WT1_combined = factor(ifelse(M_Label %in% internalValidationSamples$internalValidationSamples_WT1_combined, "WT1", "No"), levels = c("WT1", "No"))) %>%
+  mutate(original_WT1_somatic  = factor(ifelse(M_Label %in% internalValidationSamples$internalValidationSamples_WT1_somatic_MLabel, "WT1_somatic", "No"), levels = c("WT1_somatic", "No"))) %>%
+  mutate(original_WT1_germline = factor(ifelse(M_Label %in% internalValidationSamples$internalValidationSamples_WT1_germline_MLabel, "WT1_germline", "No"), levels = c("WT1_germline", "No"))) %>%
+  left_join(result_internal$metaDataRun)
+
+result_internal$classifications_inclWT1 %>% 
+  select(original_WT1_combined, M_Label, predict)
+
+# Calculate multi-class confusion matrices
+conf_mat_int_WT1_combined <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_combined", predicted_col = "predict")
+conf_mat_int_WT1_somatic  <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_somatic", predicted_col = "predict" )
+conf_mat_int_WT1_germline <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_germline", predicted_col = "predict" )
+
+
+# Calculate binary confusion matrices (1b vs Other cluster)
+conf_mat_int_WT1_combined_binary <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_combined", predicted_col = "Prediction_binary" )
+conf_mat_int_WT1_somatic_binary  <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_somatic", predicted_col = "Prediction_binary" )
+conf_mat_int_WT1_germline_binary <- make_conf_mat_simple(result_internal$classifications_inclWT1, original_col  = "original_WT1_germline", predicted_col = "Prediction_binary" )
+
+
+
+# 3. Display & Export Confusion Matrix Plots----------------------
+# All clusters
+plot_conf_mat(conf_mat_int_WT1_combined, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline & somatic)\nPer sample", high_colour = "orange3", original_col = "original_WT1_combined")
+plot_conf_mat(conf_mat_int_WT1_somatic,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (somatic only)\nPer sample", high_colour = "orange3", original_col = "original_WT1_somatic")
+plot_conf_mat(conf_mat_int_WT1_germline, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline only)\nPer sample", high_colour = "orange3", original_col = "original_WT1_germline")
+
+
+# Plots binary (1b vs other)
+plot_conf_mat(conf_mat_int_WT1_combined_binary, predicted_col = "Prediction_binary", label_type = "count", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline & somatic)\nPer sample\nPredictionBinary", high_colour = "orange3", original_col = "original_WT1_combined")
+plot_conf_mat(conf_mat_int_WT1_somatic_binary,  predicted_col = "Prediction_binary", label_type = "count", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (somatic only)\nPer sample\nPredictionBinary", high_colour = "orange3", original_col = "original_WT1_somatic")
+plot_conf_mat(conf_mat_int_WT1_germline_binary, predicted_col = "Prediction_binary", label_type = "count", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline only)\nPer sample\nPredictionBinary", high_colour = "orange3", original_col = "original_WT1_germline")
+
+
+# Save Plots
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4EExtra1_ValidationInternal_ConfusionMatrix_WT1combined_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_int_WT1_combined, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline & somatic)\nPer sample", high_colour = "orange3", original_col = "original_WT1_combined")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4EExtra2_ValidationInternal_ConfusionMatrix_WT1somatic_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_int_WT1_somatic,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (somatic only)\nPer sample", high_colour = "orange3", original_col = "original_WT1_somatic")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,  "FIGURE4", "4EExtra3_ValidationInternal_ConfusionMatrix_WT1germline_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_int_WT1_germline, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline only)\nPer sample", high_colour = "orange3", original_col = "original_WT1_germline")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER,  "FIGURE4", "4E_ValidationInternal_ConfusionMatrix_WT1combined_Count_perSamplePredictionBinary.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_int_WT1_combined_binary, predicted_col = "Prediction_binary", label_type = "count", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline & somatic)\nPer sample\nPredictionBinary", high_colour = "orange3", original_col = "original_WT1_combined")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+
+# write.table(conf_mat_int_WT1_combined_binary %>% dplyr::select(original_WT1_combined, Prediction_binary, n, avg_prob, freq), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4E_ValidationInternal_ConfusionMatrix_WT1combined_Count_perSamplePredictionBinary.tsv"), sep = "\t")
+
+```
+
+#### Performance Metrics
+
+```{r}
+# Recode predicted values for caret evaluation
+result_internal$classifications_inclWT1_caret <- result_internal$classifications_inclWT1 %>%
+  mutate(predict_WT1_combined = ifelse(predict == "1b", "WT1", "No")) 
+
+
+cm_internal <- caret::confusionMatrix(
+  factor(result_internal$classifications_inclWT1_caret$predict_WT1_combined, levels = c("WT1", "No")),
+  reference = factor(result_internal$classifications_inclWT1_caret$original_WT1_combined, levels = c("WT1", "No"))
+)
+
+
+# Extract summary metrics internal validation
+metrics_internal <- cm_internal[["byClass"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Metric") %>%
+  dplyr::rename(Value = ".") %>%
+  dplyr::filter(Metric %in% c("Sensitivity", "Specificity", "Precision", "F1", "Balanced Accuracy"))
+
+metric_order <- rev(c("Specificity", "Sensitivity", "Precision", "F1", "Balanced Accuracy"))
+metrics_internal$Metric <- factor(metrics_internal$Metric, levels = metric_order)
+
+# Function to plot performance metrics
+plot_metrics <- function(metrics_df, title = "Overall Performance") {
+  ggplot(metrics_df, aes(x = Metric, y = Value)) +
+    geom_col(fill = "orange3", width = 0.6) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    labs(title = title, x = "", y = "") +
+    theme_Publication()
+}
+
+# Plot and save internal cohort performance
+overallPerformancePlot_internal <- plot_metrics(metrics_internal, title = "Overall Performance - Internal Validation")
+overallPerformancePlot_internal
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4D_ValidationInternal_OverallClassifierPerformance.pdf"), width = 8, height = 3.25)
+overallPerformancePlot_internal
+# dev.off()
+
+# write.table(metrics_internal, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4D_ValidationInternal_OverallClassifierPerformance.tsv"), sep = "\t")
+
+```
+
+
+
+### External Validation cohort
+
+#### Classification
+
+```{r}
+# Extract classifier probes for external cohort
+validationExternalBetaValues_reducedFeature <- betas_ValidationCohorts[createdModelsMinority$reducedFeatures,sample_sheets$sample_sheet_externalValidation$M_Label]
+
+`%notin%` <<- Negate(`%in%`)
+
+# Execute classifier on external cohort
+result_external <- runMinorityClassifier(
+  createdModelsMinorityList = createdModelsMinority,
+  MethDataNew = validationExternalBetaValues_reducedFeature,
+  outputDir = file.path(outputDirValidation, "External"),
+  sample_sheet = sample_sheets$sample_sheet_externalValidation,
+  whichKimputation = 3,
+  saveModel = TRUE
+)
+
+# Append binary call (Cluster 1b vs Other)
+result_external$classifications <- result_external$classifications %>% 
+  mutate(Prediction_binary = ifelse(predict == "1b", "1b", "Other"))
+result_external$classifications
+
+result_external$metaDataRun
+
+# write.table(result_external$classifications, quote = FALSE, row.names = TRUE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4H_ValidationExternal_ClassifierResults.tsv"), sep = "\t")
+
+```
+
+
+#### Confusion Matrix
+
+##### Per sample
+
+```{r}
+# 1. Map Known WT1 Cases (External Cohort) --------
+
+externalValidationSamples <- list()
+
+## somatic
+externalValidationSamples$externalValidationSamples_WT1_somatic <- sample_sheets$sample_sheet_externalValidation %>% 
+  filter(WT1 == "1") %>% 
+  pull(M_Label)
+
+## germline
+externalValidationSamples$externalValidationSamples_WT1_germline <- sample_sheets$sample_sheet_externalValidation %>% 
+  filter(grepl("WT1", `Type of predisposition`)) %>% 
+  pull(M_Label)
+
+## combined
+externalValidationSamples$externalValidationSamples_WT1_combined <- unique(c(externalValidationSamples$externalValidationSamples_WT1_somatic, externalValidationSamples$externalValidationSamples_WT1_germline))
+
+
+# 2. Build Per-Sample Dataframe & Calculate Matrices----------------
+
+result_external$classifications_inclWT1 <- result_external$classifications %>% rownames_to_column("M_Label") %>%
+  mutate(original_WT1_combined = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_combined, "WT1", "No"), levels = c("WT1", "No"))) %>%  
+  mutate(original_WT1_somatic  = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_somatic, "WT1_somatic", "No"), levels = c("WT1_somatic", "No"))) %>%
+  mutate(original_WT1_germline = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_germline, "WT1_germline", "No"), levels = c("WT1_germline", "No"))) %>%
+  left_join(result_external$metaDataRun)
+
+# What type of samples do we have in the external validation cohort
+unique(result_external$classifications_inclWT$`Type of sample`)
+
+
+# External validation Multi-class matrices -------------
+conf_mat_ext_WT1_combined <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_combined",
+  predicted_col = "predict"
+)
+
+conf_mat_ext_WT1_somatic <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "predict"
+)
+
+conf_mat_ext_WT1_germline <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_germline",
+  predicted_col = "predict"
+)
+
+# External validation confusion matrices binary-----
+
+conf_mat_ext_WT1_combined_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_combined",
+  predicted_col = "Prediction_binary"
+)
+
+conf_mat_ext_WT1_somatic_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "Prediction_binary"
+)
+
+conf_mat_ext_WT1_germline_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1,
+  original_col  = "original_WT1_germline",
+  predicted_col = "Prediction_binary"
+)
+
+
+
+
+# 3. Display & Export Plots --------------------
+
+plot_conf_mat(conf_mat_ext_WT1_combined, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_combined")
+plot_conf_mat(conf_mat_ext_WT1_somatic,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_somatic")
+plot_conf_mat(conf_mat_ext_WT1_germline, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_germline")
+
+
+
+# Plots binary ----
+
+plot_conf_mat(conf_mat_ext_WT1_combined_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "Prediction_binary")
+plot_conf_mat(conf_mat_ext_WT1_somatic_binary,  label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "Prediction_binary")
+plot_conf_mat(conf_mat_ext_WT1_germline_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "Prediction_binary")
+
+
+
+# Save Plots -----
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra1_ValidationExternal_ConfusionMatrix_WT1combined_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_combined")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4HExtra2_ValidationExternal_ConfusionMatrix_WT1somatic_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_somatic")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra3_ValidationExternal_ConfusionMatrix_WT1germline_CountRelativeFreq_perSample.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_germline")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+
+
+
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra5_ValidationExternal_ConfusionMatrix_WT1combined_Count_perSample_BinaryClassification.pdf"),
+# width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "Prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra6_ValidationExternal_ConfusionMatrix_WT1somatic_Count_perSample_BinaryClassification.pdf"),
+# width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic_binary,  label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "Prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra7_ValidationExternal_ConfusionMatrix_WT1germline_Count_perSample_BinaryClassification.pdf"),
+# width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "Prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+```
+
+
+
+##### Per Patient
+
+```{r}
+
+# 1. Map Known WT1 Cases on a Per-Patient Level
+
+## somatic
+externalValidationSamples$externalValidationSamples_WT1_somatic_PerPatient <- sample_sheets$sample_sheet_externalValidation %>% 
+  filter(WT1 == "1") %>% 
+  pull(Case) %>% 
+  unique()
+
+## germline
+externalValidationSamples$externalValidationSamples_WT1_germline_PerPatient <- sample_sheets$sample_sheet_externalValidation %>% 
+  filter(grepl("WT1", `Type of predisposition`)) %>% 
+  pull(Case) %>% 
+  unique()
+
+## combined
+externalValidationSamples$externalValidationSamples_WT1_combined_PerPatient <- unique(c(externalValidationSamples$externalValidationSamples_WT1_somatic_PerPatient, externalValidationSamples$externalValidationSamples_WT1_germline_PerPatient))
+
+
+# Aggregate sample-level calls to majority/patient-level calls
+patient_predictions <- summarise_patient_predictions(result_external$classifications %>% 
+                                                       rownames_to_column("M_Label"))
+
+# Label each patient with the true class and binary predicted class
+result_external$classifications_inclWT1_perPatient <- patient_predictions %>%
+  mutate(original_WT1_combined = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_combined_PerPatient, "WT1", "No"), levels = c("WT1", "No"))) %>%  
+  mutate(original_WT1_somatic  = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_somatic_PerPatient, "WT1_somatic", "No"), levels = c("WT1_somatic", "No"))) %>%
+  mutate(original_WT1_germline = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_germline_PerPatient, "WT1_germline", "No"), levels = c("WT1_germline", "No"))) %>%
+  mutate(final_prediction_binary = ifelse(final_prediction == "1b", "1b", "Other"))
+
+# Calculate patient-level multi-class confusion matrices
+conf_mat_ext_WT1_combined_perPatient <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_combined",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_somatic_perPatient <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_germline_perPatient <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_germline",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+# External validation confusion matrices binary-----
+conf_mat_ext_WT1_combined_perPatient_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_combined",
+  predicted_col = "final_prediction_binary",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_somatic_perPatient_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "final_prediction_binary",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_germline_perPatient_binary <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient,
+  original_col  = "original_WT1_germline",
+  predicted_col = "final_prediction_binary",
+  probability_col = "avg_probability"
+)
+
+
+
+
+# 2. Preview & Export Patient-Level Heatmaps ------------------------------------
+
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction")
+
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction")
+
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction")
+
+
+# Plots binary ----
+
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction_binary")
+
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient_binary,  label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction_binary")
+
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction_binary")
+
+
+
+
+# Save Plots -----
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra8_ValidationExternal_ConfusionMatrix_WT1combined_CountRelativeFreq_perPatient.pdf"),
+#     width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra9_ValidationExternal_ConfusionMatrix_WT1somatic_CountRelativeFreq_perPatient.pdf"),
+#     width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4HExtra10_ValidationExternal_ConfusionMatrix_WT1germline_CountRelativeFreq_perPatient.pdf"),
+#     width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+
+# Save binary Plots -----
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4H_ValidationExternal_ConfusionMatrix_WT1combined_Count_perPatient_binary.pdf"),
+#     width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURE4", "4HExtra12_ValidationExternal_ConfusionMatrix_WT1somatic_Count_perPatient_binary.pdf"),
+#     width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient_binary,  label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4HExtra13_ValidationExternal_ConfusionMatrix_WT1germline_Count_perPatient_binary.pdf"),
+#     width = 5, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction_binary")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# write.table(conf_mat_ext_WT1_combined_perPatient_binary %>% dplyr::select(original_WT1_combined, final_prediction_binary, n, avg_prob, freq), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4H_ValidationExternal_ConfusionMatrix_WT1combined_Count_perPatient_binary.tsv"), sep = "\t")
+
+
+```
+
+#### Performance Metrics
+
+```{r}
+# Recode predicted values for caret evaluation
+result_external$classifications_inclWT1_caret <- result_external$classifications_inclWT1 
+result_external$classifications_inclWT1_perPatient_caret <- result_external$classifications_inclWT1_perPatient 
+
+
+result_external$classifications_inclWT1_caret <- result_external$classifications_inclWT1_caret %>%
+  mutate(predict_WT1_combined = ifelse(predict == "1b", "WT1", "No")) 
+
+
+result_external$classifications_inclWT1_perPatient_caret <-  result_external$classifications_inclWT1_perPatient_caret %>%
+  mutate(predict_WT1_combined = ifelse(final_prediction == "1b", "WT1", "No"))
+
+cm_sample <- caret::confusionMatrix(
+  factor(result_external$classifications_inclWT1_caret$predict_WT1_combined,  levels = c("WT1", "No")),
+  reference = factor(result_external$classifications_inclWT1_caret$original_WT1_combined,  levels = c("WT1", "No"))
+)
+
+cm_patient <- caret::confusionMatrix(
+  factor(result_external$classifications_inclWT1_perPatient_caret$predict_WT1_combined,  levels = c("WT1", "No")),
+  reference = factor(result_external$classifications_inclWT1_perPatient_caret$original_WT1_combined,  levels = c("WT1", "No"))
+)
+
+# Extract sample-level and patient-level metrics
+metrics_sample <- cm_sample[["byClass"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Metric") %>%
+  dplyr::rename(Value = ".") %>%
+  dplyr::filter(Metric %in% c("Sensitivity", "Specificity", "Precision", "F1", "Balanced Accuracy"))
+
+metrics_patient <- cm_patient[["byClass"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Metric") %>%
+  dplyr::rename(Value = ".") %>%
+  dplyr::filter(Metric %in% c("Sensitivity", "Specificity", "Precision", "F1", "Balanced Accuracy"))
+
+metric_order <- rev(c("Specificity", "Sensitivity", "Precision", "F1", "Balanced Accuracy"))
+metrics_sample$Metric <- factor(metrics_sample$Metric, levels = metric_order)
+
+# Generate and display plots
+plot_metrics <- function(metrics_df, title = "Overall Performance") {
+  ggplot(metrics_df, aes(x = Metric, y = Value)) +
+    geom_col(fill = "#2E3B87", width = 0.6) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    labs(title = title, x = "", y = "") +
+    theme_Publication()
+}
+
+# Plot per sample
+overallPerformancePlot_PerSample <- plot_metrics(metrics_sample, title = "Overall Performance - External Validation (Per Sample)")
+
+# Plot per patient
+overallPerformancePlot_PerPatient <- plot_metrics(metrics_patient, title = "Overall Performance - External Validation (Per Patient)")
+
+
+overallPerformancePlot_PerSample
+overallPerformancePlot_PerPatient
+
+
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4GExtra_ValidationExternal_OverallClassifierPerformance_PerSample.pdf"), width = 8, height = 3.25)
+overallPerformancePlot_PerSample
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4G_ValidationExternal_OverallClassifierPerformance_PerPatient.pdf"), width = 8, height = 3.25)
+overallPerformancePlot_PerPatient
+# dev.off()
+
+
+# write.table(metrics_patient, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4G_ValidationExternal_OverallClassifierPerformance_PerPatient.tsv"), sep = "\t")
+
+```
+
+```{r}
+# Check misclassifications 
+result_external$classifications_inclWT1_perPatient %>% 
+  filter(original_WT1_combined == "WT1" & final_prediction != "1b")
+
+result_external$classifications_inclWT1_perPatient %>% 
+  filter(original_WT1_combined == "No" & final_prediction == "1b")
+```
+
+
+#### Confusion matrix without low quality samples
+
+##### Per sample
+
+```{r}
+
+# use only samples with high confidence
+result_external$classifications_woLowProbability <- result_external$classifications %>% filter(probability > 72)
+
+### per sample
+result_external$classifications_inclWT1_woLowProbability <- result_external$classifications_woLowProbability %>% rownames_to_column("M_Label") %>%
+  mutate(original_WT1_combined = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_combined, "WT1", "No"), levels = c("WT1", "No"))) %>%  
+  mutate(original_WT1_somatic  = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_somatic, "WT1_somatic", "No"), levels = c("WT1_somatic", "No"))) %>%
+  mutate(original_WT1_germline = factor(ifelse(M_Label %in% externalValidationSamples$externalValidationSamples_WT1_germline, "WT1_germline", "No"), levels = c("WT1_germline", "No"))) %>%
+  left_join(result_external$metaDataRun)
+
+# what type of samples do we have in the external validation cohort
+unique(result_external$classifications_inclWT1_woLowProbability$`Type of sample`)
+
+
+# External validation confusion matrices -----
+conf_mat_ext_WT1_combined_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_woLowProbability,
+  original_col  = "original_WT1_combined",
+  predicted_col = "predict"
+)
+
+conf_mat_ext_WT1_somatic_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_woLowProbability,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "predict"
+)
+
+conf_mat_ext_WT1_germline_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_woLowProbability,
+  original_col  = "original_WT1_germline",
+  predicted_col = "predict"
+)
+
+
+
+# Plots ----
+
+plot_conf_mat(conf_mat_ext_WT1_combined_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_combined")
+plot_conf_mat(conf_mat_ext_WT1_somatic_woLowProbability,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_somatic")
+plot_conf_mat(conf_mat_ext_WT1_germline_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_germline")
+
+
+
+# Save Plots -----
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3",  "3SExtra9_ValidationExternal_ConfusionMatrix_WT1combined_CountRelativeFreq_perSample_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_combined")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3",  "3SExtra10_ValidationExternal_ConfusionMatrix_WT1somatic_CountRelativeFreq_perSample_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic_woLowProbability,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_somatic")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURES3",  "3SExtra11_ValidationExternal_ConfusionMatrix_WT1germline_CountRelativeFreq_perSample_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer sample (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_germline")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+```
+
+##### Per Patient
+
+```{r}
+
+# Aggregate high-confidence predictions per patient
+patient_predictions_woLowProbability <- summarise_patient_predictions(result_external$classifications_woLowProbability %>% 
+                                                                        rownames_to_column("M_Label"))
+
+
+# Calculate patient-level matrices
+result_external$classifications_inclWT1_perPatient_woLowProbability <- patient_predictions_woLowProbability %>%
+  mutate(original_WT1_combined = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_combined_PerPatient, "WT1", "No"), levels = c("WT1", "No"))) %>%   
+  mutate(original_WT1_somatic  = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_somatic_PerPatient, "WT1_somatic", "No"), levels = c("WT1_somatic", "No"))) %>%
+  mutate(original_WT1_germline = factor(ifelse(patient %in% externalValidationSamples$externalValidationSamples_WT1_germline_PerPatient, "WT1_germline", "No"), levels = c("WT1_germline", "No"))) 
+
+# External validation confusion matrices -----
+
+conf_mat_ext_WT1_combined_perPatient_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient_woLowProbability,
+  original_col  = "original_WT1_combined",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_somatic_perPatient_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient_woLowProbability,
+  original_col  = "original_WT1_somatic",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+conf_mat_ext_WT1_germline_perPatient_woLowProbability <- make_conf_mat_simple(
+  result_external$classifications_inclWT1_perPatient_woLowProbability,
+  original_col  = "original_WT1_germline",
+  predicted_col = "final_prediction",
+  probability_col = "avg_probability"
+)
+
+
+
+# Plots ----
+
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction")
+
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient_woLowProbability,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction")
+
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction")
+
+
+# Save Plots -----
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3",  "3SExtra13_ValidationExternal_ConfusionMatrix_WT1combined_CountRelativeFreq_perPatient_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_combined_perPatient_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3",  "3SExtra14_ValidationExternal_ConfusionMatrix_WT1somatic_CountRelativeFreq_perPatient_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_somatic_perPatient_woLowProbability,  label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (somatic only)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_somatic", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3",  "3SExtra15_ValidationExternal_ConfusionMatrix_WT1germline_CountRelativeFreq_perPatient_woLowProbability.pdf"),
+# width = 7, height = 5)
+plot_conf_mat(conf_mat_ext_WT1_germline_perPatient_woLowProbability, label_type = "count_relfreq", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline only)\nPer Patient (without low probability samples)", high_colour = "royalblue4", original_col = "original_WT1_germline", predicted_col = "final_prediction")+ylab("WT1 PV")+xlab("Prediction")
+# dev.off()
+```
+
+##### Performance Metrics Without Low-Confidence Samples - External Validation cohort
+
+```{r}
+
+# Recode high-confidence predictions
+result_external$classifications_inclWT1_caret_woLowProbability <- result_external$classifications_inclWT1_woLowProbability 
+result_external$classifications_inclWT1_perPatient_caret_woLowProbability <- result_external$classifications_inclWT1_perPatient_woLowProbability 
+
+
+result_external$classifications_inclWT1_caret_woLowProbability <- result_external$classifications_inclWT1_caret_woLowProbability %>%
+  mutate(predict_WT1_combined = ifelse(predict == "1b", "WT1", "No")) 
+
+
+result_external$classifications_inclWT1_perPatient_caret_woLowProbability <-  result_external$classifications_inclWT1_perPatient_caret_woLowProbability %>%
+  mutate(predict_WT1_combined = ifelse(final_prediction == "1b", "WT1", "No"))
+
+cm_sample_woLowProbability <- caret::confusionMatrix(
+  factor(result_external$classifications_inclWT1_caret_woLowProbability$predict_WT1_combined,  levels = c("WT1", "No")),
+  reference = factor(result_external$classifications_inclWT1_caret_woLowProbability$original_WT1_combined,  levels = c("WT1", "No"))
+)
+
+cm_patient_woLowProbability <- caret::confusionMatrix(
+  factor(result_external$classifications_inclWT1_perPatient_caret_woLowProbability$predict_WT1_combined,  levels = c("WT1", "No")),
+  reference = factor(result_external$classifications_inclWT1_perPatient_caret_woLowProbability$original_WT1_combined,  levels = c("WT1", "No"))
+)
+
+
+# Extract performance metrics
+metrics_sample_woLowProbability <- cm_sample_woLowProbability[["byClass"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Metric") %>%
+  dplyr::rename(Value = ".") %>%
+  dplyr::filter(Metric %in% c("Sensitivity", "Specificity", "Precision", "F1", "Balanced Accuracy"))
+
+
+metrics_patient_woLowProbability <- cm_patient_woLowProbability[["byClass"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Metric") %>%
+  dplyr::rename(Value = ".") %>%
+  dplyr::filter(Metric %in% c("Sensitivity", "Specificity", "Precision", "F1", "Balanced Accuracy"))
+
+metric_order <- c("Specificity", "Sensitivity", "Precision", "F1", "Balanced Accuracy")
+metrics_sample$Metric <- factor(metrics_sample$Metric, levels = metric_order)
+
+# Plot function
+plot_metrics <- function(metrics_df, title = "Overall Performance") {
+  ggplot(metrics_df, aes(x = Metric, y = Value)) +
+    geom_col(fill = "#2E3B87", width = 0.6) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    labs(title = title, x = "", y = "") +
+    theme_Publication()
+}
+
+# Plot per sample
+overallPerformancePlot_PerSample_woLowProbability <- plot_metrics(metrics_sample_woLowProbability, title = "Overall Performance - External Validation \n(Per Sample) (without low probability samples)")
+
+# Plot per patient
+overallPerformancePlot_PerPatient_woLowProbability <- plot_metrics(metrics_patient_woLowProbability, title = "Overall Performance - External Validation \n(Per Patient) (without low probability samples)")
+
+
+overallPerformancePlot_PerSample_woLowProbability
+overallPerformancePlot_PerPatient_woLowProbability
+
+# pdf(file.path(parameters$RESULTS_FOLDER,  "FIGURES3",  "3SExtra17_ValidationExternal_OverallClassifierPerformance_PerSample_woLowProbability.pdf"), width = 8, height = 3.25)
+overallPerformancePlot_PerSample_woLowProbability
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,  "FIGURES3",  "3SExtra18_ValidationExternal_OverallClassifierPerformance_PerPatient_woLowProbability.pdf"), width = 8, height = 3.25)
+overallPerformancePlot_PerPatient_woLowProbability
+# dev.off()
+
+```
+
+
+
+## Alluvial Flow Diagrams (External Validation Cohort)
+
+```{r}
+
+# Map true WT1 status to expected methylation clusters-----------------------------------------------------------------
+wt1_to_cluster <- list(
+  WT1 = c("1b"),
+  No = c("1a", "2a", "2b", "2c")
+)
+
+# Define class order for plotting
+class_order <- c( "WT1", "No")  # original
+pred_order <- c("1a", "1b", "2a", "2b", "2c")  # predicted
+
+# 1. Compute Flow Summaries (Per Patient & Per Sample)
+validation_flow <- result_external$classifications_inclWT1_perPatient %>%
+  mutate(
+    originalCall = factor(original_WT1_combined, levels = class_order),
+    final_prediction = factor(final_prediction, levels = pred_order),
+    # element-wise check
+    classification_status = mapply(function(orig, pred) {
+      if (pred %in% wt1_to_cluster[[as.character(orig)]]) {
+        "Expected cluster"
+      } else {
+        "Unexpected cluster"
+      }
+    }, orig = originalCall, pred = final_prediction)
+  ) %>%
+  group_by(originalCall, final_prediction, classification_status) %>%
+  summarise(n = n(), .groups = "drop")
+
+# write.table(result_external$classifications_inclWT1_perPatient %>% dplyr::select(patient, original_WT1_combined, final_prediction_binary), quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURES3", "RAW_DATA", "S3C_ValidationExternal_ClassificationFlow_misclassified_PerPatient.tsv"), sep = "\t")
+
+
+
+
+validation_flow_perSample <- result_external$classifications_inclWT1 %>%
+  mutate(
+    originalCall = factor(original_WT1_combined, levels = class_order),
+    predict = factor(predict, levels = pred_order),
+    # element-wise check
+    classification_status = mapply(function(orig, pred) {
+      if (pred %in% wt1_to_cluster[[as.character(orig)]]) {
+        "Expected cluster"
+      } else {
+        "Unexpected cluster"
+      }
+    }, orig = originalCall, pred = predict)
+  ) %>%
+  group_by(originalCall, predict, classification_status) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+# 2. Render & Export Alluvial Plots -----------------------------------------------------------------
+# Alluvial plot
+validation_flow_plot <- ggplot(validation_flow,
+                               aes(axis1 = originalCall, axis2 = final_prediction, y = n, fill = originalCall)) +
+  geom_alluvium(aes(alpha = classification_status), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey80", color = "black") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = c("Original WT1 status", "Predicted DNAm cluster")) +
+  scale_fill_manual(values = c( "No" = "royalblue4", "WT1" = "red4")) +
+  scale_alpha_manual(values = c(`Expected cluster` = 0.3,
+                                `Unexpected cluster` = 1)) +  # highlight unexpected flows
+  theme_minimal() +
+  labs(title = "Validation Cohort: Original WT1 vs Predicted DNAm cluster\nPer patient",
+       y = "Number of samples", x = "", fill = "Original WT1", alpha = "Classification")
+
+validation_flow_plot
+
+# Alluvial plot
+validation_flow_plot_perSample <- ggplot(validation_flow_perSample,
+                                         aes(axis1 = originalCall, axis2 = predict, y = n, fill = originalCall)) +
+  geom_alluvium(aes(alpha = classification_status), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey80", color = "black") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = c("Original WT1 status", "Predicted DNAm cluster")) +
+  scale_fill_manual(values = c( "No" = "royalblue4", "WT1" = "red4")) +
+  scale_alpha_manual(values = c(`Expected cluster` = 0.3,
+                                `Unexpected cluster` = 1)) +  # highlight unexpected flows
+  theme_minimal() +
+  labs(title = "Validation Cohort: Original WT1 vs Predicted DNAm cluster\nPer sample",
+       y = "Number of samples", x = "", fill = "Original WT1", alpha = "Classification")
+
+validation_flow_plot_perSample
+
+
+# pdf(file.path(parameters$RESULTS_FOLDER, "FIGURES3",  "3SC_ValidationExternal_ClassificationFlow_misclassified_PerPatient.pdf"), width = 9, height = 8)
+validation_flow_plot
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,  "FIGURES3",  "3SExtra21_ValidationExternal_ClassificationFlow_misclassified_PerSample.pdf"), width = 9, height = 8)
+validation_flow_plot_perSample
+# dev.off()
+
+```
+
+
+
+
+### Summary plots: Classification vs WT1 status (Internal and External)
+
+```{r}
+# Aggregate prediction counts by true WT1 status
+result_internal$classifications_inclWT1_summary <- result_internal$classifications_inclWT1 %>% 
+  mutate(Pred = ifelse(Prediction_binary == "1b", "1b", "Other")) %>% 
+  mutate(WT1_PV = ifelse(original_WT1_combined == "WT1", "Yes", "No")) %>% 
+  group_by(WT1_PV, Pred) %>% 
+  summarise(Count = n())
+
+
+result_external$classifications_inclWT1_perPatient_summary <- result_external$classifications_inclWT1_perPatient %>% 
+  mutate(Pred = ifelse(final_prediction_binary == "1b", "1b", "Other")) %>% 
+  mutate(WT1_PV = ifelse(original_WT1_combined == "WT1", "Yes", "No")) %>% 
+  group_by(WT1_PV, Pred) %>% 
+  summarise(Count = n())
+
+
+# Reorder factor levels
+result_internal$classifications_inclWT1_summary$WT1_PV <- factor(result_internal$classifications_inclWT1_summary$WT1_PV, levels = c("Yes", "No"))
+result_internal$classifications_inclWT1_summary$Pred   <- factor(result_internal$classifications_inclWT1_summary$Pred, c("Other", "1b"))
+
+result_external$classifications_inclWT1_perPatient_summary$WT1_PV <- factor(result_external$classifications_inclWT1_perPatient_summary$WT1_PV, levels = c("Yes", "No"))
+result_external$classifications_inclWT1_perPatient_summary$Pred   <- factor(result_external$classifications_inclWT1_perPatient_summary$Pred, levels = c("Other", "1b"))
+
+# -------------------------
+# Absolute count barplots
+# -------------------------
+
+plotInternalSummary <- ggplot(result_internal$classifications_inclWT1_summary, aes(x = WT1_PV, y = Count, fill = Pred)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("1b" = "#E69F00", "Other" = "#F5C97A")) +
+  labs(title = "Internal", x = "WT1 PV", y = "Count", fill = "Prediction") +
+  theme_minimal()
+
+plotExternalSummary <- ggplot(result_external$classifications_inclWT1_perPatient_summary, aes(x = WT1_PV, y = Count, fill = Pred)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("1b" = "#0072B2", "Other" = "#9AD0F3")) +
+  labs(title = "External", x = "WT1 PV", y = "Count", fill = "Prediction") +
+  theme_minimal()
+
+plotInternalSummary + plotExternalSummary
+
+#--- 
+# Calculate relative proportions (%)
+
+result_internal$classifications_inclWT1_summary_perc <- result_internal$classifications_inclWT1_summary %>%
+  group_by(WT1_PV) %>%
+  mutate(Percent = Count / sum(Count) * 100)
+
+result_external$classifications_inclWT1_perPatient_summary_perc <- result_external$classifications_inclWT1_perPatient_summary %>%
+  group_by(WT1_PV) %>%
+  mutate(Percent = Count / sum(Count) * 100)
+
+# -------------------------
+# Percentage stacked barplots
+# -------------------------
+
+plotInternalSummary_Perc <- ggplot(result_internal$classifications_inclWT1_summary_perc, aes(x = WT1_PV, y = Percent, fill = Pred)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("1b" = "orange3", "Other" = "#F5C97A")) +
+  labs(title = "Internal", x = "WT1 PV", y = "Percentage (%)", fill = "Prediction") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(family = "Helvetica"),
+    legend.direction = "vertical") +
+  guides(
+    colour = guide_legend(ncol = 1),
+    fill = guide_legend(ncol = 1, ),
+    shape = guide_legend(ncol = 1)
+  )
+
+plotExternalSummary_perc <- ggplot(result_external$classifications_inclWT1_perPatient_summary_perc, aes(x = WT1_PV, y = Percent, fill = Pred)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("1b" = "royalblue4", "Other" = "#AFBEE9")) +
+  labs(title = "External", x = "WT1 PV", y = "Percentage (%)", fill = "Prediction") +
+  # theme_Publication()+ 
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(family = "Helvetica"),
+    legend.direction = "vertical") +
+  guides(
+    colour = guide_legend(ncol = 1),
+    fill = guide_legend(ncol = 1, ),
+    shape = guide_legend(ncol = 1)
+  )
+
+plotInternalSummary_Perc + plotExternalSummary_perc
+
+# --- Save plots and data
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4F_ValidationInternal_SummaryWT1vsClassification.pdf"), width = 8/2.54, height = 8/2.54)
+plotInternalSummary_Perc
+# dev.off()
+
+# pdf(file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4I_ValidationExternal_SummaryWT1vsClassification.pdf"), width = 8/2.54, height = 8/2.54)
+plotExternalSummary_perc
+# dev.off()
+
+# write.table(result_internal$classifications_inclWT1_summary_perc, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4F_ValidationInternal_SummaryWT1vsClassification.tsv"), sep = "\t")
+
+# write.table(result_external$classifications_inclWT1_perPatient_summary_perc, quote = FALSE, row.names = FALSE, file = file.path(parameters$RESULTS_FOLDER, "FIGURE4", "RAW_DATA", "4I_ValidationExternal_SummaryWT1vsClassification.tsv"), sep = "\t")
+
+
+
+```
+
+
+## Combine all Validation Plots
+
+```{r}
+# Apply custom publication styling
+theme_pub <- theme_classic(base_size = 6) +
+  theme(
+    plot.margin = ggplot2::margin(0, 0, 0, 0),
+    
+    axis.title = element_text( family = "Helvetica", face = "bold", size = 7 ),    # Axis titles
+    axis.text = element_text(family = "Helvetica",face = "plain",size = 6),    # Axis tick labels
+    legend.title = element_text(family = "Helvetica",face = "bold.italic",size = 6),    # Legend title (header)
+    legend.text = element_text(family = "Helvetica",face = "plain",size = 5),    # Legend labels
+    
+    # Legend placement
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    
+    # Make legend more compact
+    legend.key.size = unit(3, "mm"),
+    
+    legend.spacing.y = unit(0, "mm"),
+    
+    legend.margin = ggplot2::margin(0, 0, 0, 0),
+    legend.box.margin = ggplot2::margin(0, 0, 0, 0),
+    
+    legend.key.height = unit(1, "mm"),
+    legend.key.width  = unit(4, "mm"),
+    legend.spacing.x  = unit(1.5, "mm"),
+    legend.box.spacing = unit(0.5, "mm"),
+    
+    # Remove background and grid
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_rect(fill = "white", colour = NA),
+    
+    # Keep only axes
+    axis.line = element_line(colour = "black"),
+    
+    # Facets (if used)
+    strip.background = element_blank(),
+    strip.text = element_text(
+      family = "Helvetica",
+      face = "bold",
+      size = 7
+    )
+  )
+systemfonts::match_font("Helvetica")
+
+# Format Internal Panels (4D, 4E, 4F)
+plot4D <- overallPerformancePlot_internal+ theme_pub 
+plot4E <- plot_conf_mat(conf_mat_int_WT1_combined_binary, predicted_col = "Prediction_binary", label_type = "count", title = "Confusion Matrix Heatmap\ninternal Validation - WT1 (germline & somatic)\nPer sample\nPredictionBinary", high_colour = "orange3", original_col = "original_WT1_combined")+ylab("WT1 PV")+xlab("Prediction") + theme_pub +  ggtitle("") +geom_text(
+  aes(label = display_label),
+  family = "Helvetica",
+  fontface = "plain",
+  size = 5/2.845
+)
+plot4E$layers[[2]] <- NULL
+plot4F <- plotInternalSummary_Perc + theme_pub
+
+plot4D/(plot4E + plot4F)
+
+# Format External Panels (4G, 4H, 4I)
+plot4G <- overallPerformancePlot_PerPatient + theme_pub
+plot4H <- plot_conf_mat(conf_mat_ext_WT1_combined_perPatient_binary, label_type = "count", title = "Confusion Matrix Heatmap\nExternal Validation - WT1 (germline & somatic)\nPer Patient\nbinary prediction", high_colour = "royalblue4", original_col = "original_WT1_combined", predicted_col = "final_prediction_binary")+ylab("WT1 PV")+xlab("Prediction") + theme_pub+  ggtitle("") +geom_text(
+  aes(label = display_label),
+  family = "Helvetica",
+  fontface = "plain",
+  size = 5/2.845
+)
+plot4I <- plotExternalSummary_perc + theme_pub
+plot4H$layers[[2]] <- NULL
+
+
+
+
+# Assemble composite layout
+left  <- plot4D / (plot4E + plot4F + plot_layout(widths = c(2, 1)))
+right <- plot4G / (plot4H + plot4I + plot_layout(widths = c(2, 1)))
+
+left <- left &
+  theme(plot.margin = ggplot2::margin(r = 4, unit = "mm"))
+
+right <- right &
+  theme(plot.margin = ggplot2::margin(l = 4, unit = "mm"))
+
+combined <- left | right
+
+# Save combined composite PDF figure
+# ggsave(
+#   filename = file.path(parameters$RESULTS_FOLDER,"FIGURE4", "4D_4Icombined.pdf"),
+#   plot = combined,
+#   width = 165,
+#   height = 82,
+#   units = "mm",
+#   device = cairo_pdf
+# )
+```
+
+

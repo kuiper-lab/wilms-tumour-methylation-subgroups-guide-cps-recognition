@@ -1,0 +1,28 @@
+variant	variant_label	color	group	is_hit	OtherBiomaterial	NewOld
+None_WT1	No variant	#D6D6D6	WT1	FALSE		New
+Truncating/Deletion	Truncating/Deletion	#AC2020	WT1	TRUE		New
+None	No variant	#D6D6D6	Copy number/LOH	FALSE		New
+Truncating_or_Deletion	Truncating/Deletion	#AC2020	WT1	TRUE		New
+Truncating/Deletion_VUS	Truncating Deletion (VUS)	#FFB4B4	WT1	TRUE		New
+Complex	Complex	#E07400	WT1	TRUE		New
+Complex_SV_or_SV	(Complex) SV	#E07400	WT1	TRUE		New
+SV_VUS	SV (VUS)	#FFCE99	WT1	TRUE		New
+Splice	Splice	#FFE347	WT1	TRUE		New
+Missense	Missense	#FCB322	WT1	TRUE		New
+Missense_VUS	Missense (VUS)	#FFFBB6	WT1	FALSE		New
+Exon3_Missense_Stabilising	Exon3 Missense - Stabilising	#6AC86F	CTNNB1	FALSE		New
+Exon3_S45del_Stabilising	Exon3 S45del - Stabilising	#2E7D32	CTNNB1	FALSE		New
+Exon3_Missense_Stabilising_OtherBiomaterial	Exon3 Missense - Stabilising (Other Biomaterial)	#6AC86F	CTNNB1	FALSE	•	New
+Exon3_S45del_Stabilising_OtherBiomaterial	Exon3 S45del - Stabilising (Other Biomaterial)	#2E7D32	CTNNB1	FALSE	•	New
+None_CTNNB1	No variant	#D6D6D6	CTNNB1	FALSE		New
+PartsExon3Deleted	Part Exon 3 deleted	#235A24	CTNNB1	FALSE		New
+LOH_alreadyInSV	LOH_alreadyInSV	grey	Technical / missing / flags	FALSE		New
+None_WT1_Diagnostics_butNotCheckedResearch	No variant (checked only in diagnostics)	#D6D6D6		FALSE	-	New
+NotTested	Not tested	#ECECEC	Technical / missing / flags	FALSE		New
+NoSNVsOnlyWXSThusNoSVsChecked	NoSNVsOnlyWXSThusNoSVsChecked	grey80	Technical / missing / flags	FALSE		New
+noData	No data	#ECECEC	Technical / missing / flags	FALSE		New
+WXSnotAnalysed	WXSnotAnalysed	grey80	Technical / missing / flags	FALSE		New
+notAnalysed	notAnalysed	black	Technical / missing / flags	FALSE		New
+BadQuality	BadQuality	#ECECEC	Technical / missing / flags	FALSE		New
+sampleSwap	sampleSwap	#ECECEC	Technical / missing / flags	FALSE		New	
+NoneBadQuality	NoneBadQuality	#ECECEC	Technical / missing / flags	FALSE		New
